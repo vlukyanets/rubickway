@@ -1,0 +1,5 @@
+# Gitignored files Claude Code copies into every new worktree (.claude/worktrees/<name>/).
+# .gitignore syntax; only files that match here AND are gitignored are copied.
+.env
+.env.local
+CLAUDE.local.md

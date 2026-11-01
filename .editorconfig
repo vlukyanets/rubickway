@@ -1,0 +1,21 @@
+root = true
+
+# Default: 4 spaces (Python, Rust, C/C++, Java, C#, shell, ...)
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# 2 spaces: data/config formats, web and JS/TS (Prettier's default), Markdown
+[*.{json,jsonc,json5,yml,yaml,toml,xml,html,css,scss,less,js,jsx,mjs,cjs,ts,tsx,mts,cts,vue,svelte,md}]
+indent_size = 2
+
+# Tabs required by the language or tool
+[{Makefile,*.mk,*.go}]
+indent_style = tab
+
+[*.md]
+trim_trailing_whitespace = false

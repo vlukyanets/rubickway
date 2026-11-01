@@ -1,0 +1,7 @@
+# Normalise line endings in the repo; check out text files with LF on every OS.
+* text=auto eol=lf
+
+# Windows batch files need CRLF. (PowerShell runs LF scripts fine - and Spec Kit's
+# managed .ps1 files must stay byte-identical, or upgrades treat them as modified.)
+*.bat text eol=crlf
+*.cmd text eol=crlf
