@@ -7,7 +7,7 @@ use crate::canvas::Size;
 use crate::input::InputEvent;
 
 /// An event from a backend to the rest of the compositor.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BackendEvent {
     /// Input for the viewer.
     Input(InputEvent),
@@ -19,4 +19,8 @@ pub enum BackendEvent {
     FrameDone,
     /// The host asked to close the viewer window.
     CloseRequested,
+    /// The host's keymap (xkb text v1), forwarded to applications.
+    Keymap(String),
+    /// The host's key repeat settings: `rate` keys per second (0 = no repeat), `delay` ms.
+    RepeatInfo { rate: i32, delay: i32 },
 }

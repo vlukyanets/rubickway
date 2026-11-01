@@ -77,6 +77,22 @@ impl Viewer {
         self.camera
     }
 
+    /// Replaces the camera (zoom clamped to the limits); marks the viewer dirty if it changed.
+    pub fn set_camera(&mut self, camera: Camera) {
+        let zoom = if camera.zoom.is_finite() {
+            camera
+                .zoom
+                .clamp(crate::canvas::ZOOM_MIN, crate::canvas::ZOOM_MAX)
+        } else {
+            self.camera.zoom
+        };
+        let camera = Camera { zoom, ..camera };
+        if camera != self.camera {
+            self.camera = camera;
+            self.dirty = true;
+        }
+    }
+
     /// Logical size.
     pub fn size(&self) -> Size {
         self.size
@@ -124,6 +140,11 @@ impl Viewer {
         GridParams::new(&self.camera, self.size, self.render_scale())
     }
 
+    /// The last pointer position in logical pixels, if the pointer is over the viewer.
+    pub fn pointer(&self) -> Option<Point> {
+        self.pointer
+    }
+
     /// Whether a pan drag is in progress (for the cursor shape).
     pub fn is_panning(&self) -> bool {
         self.gesture.is_panning()
@@ -165,10 +186,11 @@ impl Viewer {
 
     fn dispatch(&mut self, event: &InputEvent) -> Effect {
         match *event {
-            InputEvent::Modifiers { mods } => self.modifiers = mods,
+            InputEvent::Modifiers { mods, .. } => self.modifiers = mods,
             InputEvent::Key {
                 binding_sym,
                 pressed,
+                ..
             } => {
                 if let Some(action) = bindings::lookup(self.modifiers, binding_sym, pressed) {
                     return self.run(action);
@@ -191,6 +213,7 @@ impl Viewer {
             InputEvent::PointerButton {
                 button: Button::Left,
                 pressed,
+                ..
             } => self.left_button(pressed),
             InputEvent::PointerButton { .. } => {}
             InputEvent::Scroll {
@@ -223,6 +246,8 @@ impl Viewer {
                 self.modifiers = Modifiers::NONE;
                 self.gesture = Gesture::Idle;
             }
+            // Modifiers follow in their own event.
+            InputEvent::FocusGained => {}
         }
         Effect::default()
     }

@@ -33,6 +33,22 @@ The full check, the same as CI:
 cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked
 ```
 
+## Running applications on RubickWay
+
+On startup RubickWay prints the socket applications connect to:
+
+```text
+INFO rubickway: applications can connect with WAYLAND_DISPLAY=wayland-2
+```
+
+Start an application from a host terminal with that name. Only applications that draw into
+shared memory are supported for now; GPU applications such as kitty run with Mesa's software
+renderer:
+
+```sh
+WAYLAND_DISPLAY=wayland-2 LIBGL_ALWAYS_SOFTWARE=1 kitty
+```
+
 ## Development workflow
 
 Features are built with [GitHub Spec Kit](https://github.com/github/spec-kit):

@@ -1,8 +1,15 @@
 //! Viewer behaviour driven by backend-neutral input events.
 
 use rubickway::canvas::{Camera, Size};
-use rubickway::input::{InputEvent, Keysym, Modifiers};
+use rubickway::input::{InputEvent, Keysym, Modifiers, RawModifiers};
 use rubickway::viewer::Viewer;
+
+fn modifiers(mods: Modifiers) -> InputEvent {
+    InputEvent::Modifiers {
+        mods,
+        raw: RawModifiers::default(),
+    }
+}
 
 fn alt_shift() -> Modifiers {
     Modifiers {
@@ -14,6 +21,7 @@ fn alt_shift() -> Modifiers {
 
 fn press(viewer: &mut Viewer, sym: Keysym) -> rubickway::viewer::Effect {
     viewer.handle(&InputEvent::Key {
+        keycode: 0,
         binding_sym: sym,
         pressed: true,
     })
@@ -106,15 +114,16 @@ fn buffer_is_scaled_down_uniformly_to_the_gpu_maximum() {
 #[test]
 fn mod_shift_q_quits() {
     let mut viewer = Viewer::new();
-    viewer.handle(&InputEvent::Modifiers { mods: alt_shift() });
+    viewer.handle(&modifiers(alt_shift()));
     assert!(press(&mut viewer, Keysym::q).quit);
 }
 
 #[test]
 fn quit_triggers_on_press_only() {
     let mut viewer = Viewer::new();
-    viewer.handle(&InputEvent::Modifiers { mods: alt_shift() });
+    viewer.handle(&modifiers(alt_shift()));
     let release = viewer.handle(&InputEvent::Key {
+        keycode: 0,
         binding_sym: Keysym::q,
         pressed: false,
     });
@@ -140,7 +149,7 @@ fn q_without_the_exact_modifiers_does_nothing() {
             ..Modifiers::NONE
         },
     ] {
-        viewer.handle(&InputEvent::Modifiers { mods });
+        viewer.handle(&modifiers(mods));
         assert!(!press(&mut viewer, Keysym::q).quit, "{mods:?}");
     }
 }
@@ -164,6 +173,7 @@ fn ready_viewer(pointer: Point) -> Viewer {
 fn button(viewer: &mut Viewer, pressed: bool) {
     viewer.handle(&InputEvent::PointerButton {
         button: Button::Left,
+        code: 0x110,
         pressed,
     });
 }
@@ -220,7 +230,7 @@ fn drag_keeps_the_grabbed_point_under_the_pointer() {
 fn mod_drag_pans_too() {
     let start = Point::new(400.0, 300.0);
     let mut viewer = ready_viewer(start);
-    viewer.handle(&InputEvent::Modifiers { mods: alt() });
+    viewer.handle(&modifiers(alt()));
     let anchor = viewer.camera().to_canvas(start, viewer.size());
     button(&mut viewer, true);
     motion(&mut viewer, Point::new(420.0, 330.0));
@@ -292,7 +302,7 @@ fn mod_scroll_zooms_one_step_per_50_px() {
     for source in [ScrollSource::Finger, ScrollSource::Continuous] {
         let p = Point::new(300.0, 300.0);
         let mut viewer = ready_viewer(p);
-        viewer.handle(&InputEvent::Modifiers { mods: alt() });
+        viewer.handle(&modifiers(alt()));
         let under = viewer.camera().to_canvas(p, viewer.size());
         finger(&mut viewer, source, Vector::new(0.0, -50.0));
         assert!((viewer.camera().zoom - 1.1).abs() < 1e-12, "{source:?}");
@@ -365,7 +375,7 @@ fn mod_0_restores_the_startup_view() {
     assert_ne!(viewer.camera(), Camera::default());
     viewer.take_dirty();
 
-    viewer.handle(&InputEvent::Modifiers { mods: alt() });
+    viewer.handle(&modifiers(alt()));
     press(&mut viewer, Keysym::_0);
     assert_eq!(viewer.camera(), Camera::default());
     assert!(viewer.take_dirty());

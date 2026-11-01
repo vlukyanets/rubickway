@@ -117,9 +117,12 @@ itself is the point (user-facing copy that needs it, tests for Unicode handling)
   `clippy.toml`, but not in helper functions of integration tests - those crates declare a
   crate-level `#![expect(..., reason = "...")]`. Elsewhere use
   `#[expect(clippy::unwrap_used, reason = "...")]`, never `#[allow(clippy::...)]`. A module
-  that needs `unsafe` opts in with `#![allow(unsafe_code)]`, and only FFI, backend, render
-  and plugin loader modules may (constitution, Principle V).
-- **Rendering tests** (`tests/render_grid.rs`) read back llvmpipe output and assert pixel
-  facts computed from the inputs (`renders_on_llvmpipe` guards the renderer). After an
-  intended visual change, update the expected values - colours come from the `render`
-  constants - and never commit reference images.
+  that needs `unsafe` opts in with `#![allow(unsafe_code)]`, and only FFI (`src/ffi/`),
+  backend, render and plugin loader modules may (constitution, Principle V).
+- **Rendering tests** (`tests/render_grid.rs`, `tests/render_windows.rs`) read back llvmpipe
+  output and assert pixel facts computed from the inputs (`renders_on_llvmpipe` guards the
+  renderer). After an intended visual change, update the expected values - colours come from
+  the `render` constants - and never commit reference images.
+- **Protocol tests** run the server in-process with `wayland-client` test clients
+  (`tests/protocol/harness.rs`); every new global needs its version in the feature's
+  `contracts/protocols.md`.
