@@ -1,0 +1,24 @@
+[package]
+name = "rubickway"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Wayland compositor with an endless canvas where every monitor is a viewer"
+license = "MIT"
+publish = false
+
+[dependencies]
+
+[lints.rust]
+# Principle V: unsafe only in FFI, backend and render modules, which opt in with
+# #[allow(unsafe_code)] on the module.
+unsafe_code = "deny"
+
+[lints.clippy]
+# Principle II: a client can never take the compositor down. clippy.toml allows
+# these in tests; elsewhere an exception needs #[expect(..., reason = "...")].
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+# Principle V: every unsafe block carries a // SAFETY: comment.
+undocumented_unsafe_blocks = "deny"

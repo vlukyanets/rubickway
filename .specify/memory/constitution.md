@@ -1,50 +1,131 @@
-# [PROJECT_NAME] Constitution
-<!-- Example: Spec Constitution, TaskFlow Constitution, etc. -->
+# RubickWay Constitution
+
+RubickWay is a Wayland compositor with an endless canvas where every monitor is a viewer.
+It is built to be the author's daily desktop and to learn how a compositor works by
+building one.
 
 ## Core Principles
 
-### [PRINCIPLE_1_NAME]
-<!-- Example: I. Library-First -->
-[PRINCIPLE_1_DESCRIPTION]
-<!-- Example: Every feature starts as a standalone library; Libraries must be self-contained, independently testable, documented; Clear purpose required - no organizational-only libraries -->
+### I. Own Implementation
 
-### [PRINCIPLE_2_NAME]
-<!-- Example: II. CLI Interface -->
-[PRINCIPLE_2_DESCRIPTION]
-<!-- Example: Every library exposes functionality via CLI; Text in/out protocol: stdin/args → stdout, errors → stderr; Support JSON + human-readable formats -->
+- The project MUST NOT depend on `smithay`, `wlroots` or any other compositor framework
+  crate.
+- Protocol code MUST use `wayland-server` / `wayland-protocols`. Hardware, session and
+  input access MUST go through system libraries (libseat, libinput, xkbcommon, drm/gbm,
+  EGL).
+- Smithay, anvil and niri are reading material only. A plan that mirrors one of their
+  modules MUST name it as a reference.
 
-### [PRINCIPLE_3_NAME]
-<!-- Example: III. Test-First (NON-NEGOTIABLE) -->
-[PRINCIPLE_3_DESCRIPTION]
-<!-- Example: TDD mandatory: Tests written → User approved → Tests fail → Then implement; Red-Green-Refactor cycle strictly enforced -->
+Rationale: owning every layer is the point of the project; system libraries are used
+where rewriting them would teach nothing and add risk.
 
-### [PRINCIPLE_4_NAME]
-<!-- Example: IV. Integration Testing -->
-[PRINCIPLE_4_DESCRIPTION]
-<!-- Example: Focus areas requiring integration tests: New library contract tests, Contract changes, Inter-service communication, Shared schemas -->
+### II. A Client Can Never Take the Compositor Down
 
-### [PRINCIPLE_5_NAME]
-<!-- Example: V. Observability, VI. Versioning & Breaking Changes, VII. Simplicity -->
-[PRINCIPLE_5_DESCRIPTION]
-<!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
+- `unwrap`, `expect` and `panic!` MUST be denied crate-wide through clippy lints
+  configured in `Cargo.toml`. A rare exception MUST use
+  `#[expect(..., reason = "...")]` with a stated reason.
+- Arithmetic on client-supplied values (sizes, offsets, strides, plane layouts) MUST use
+  checked or saturating operations, and the result MUST be validated before use.
+- A protocol violation MUST be answered with a protocol error to the offending client
+  only. A failed buffer import MUST affect only that buffer.
+- Every spec MUST list its misbehaving-client cases.
 
-## [SECTION_2_NAME]
-<!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
+Rationale: a compositor crash takes down every application in the session; clients are
+untrusted input.
 
-[SECTION_2_CONTENT]
-<!-- Example: Technology stack requirements, compliance standards, deployment policies, etc. -->
+### III. Test-First, Headless by Default
 
-## [SECTION_3_NAME]
-<!-- Example: Development Workflow, Review Process, Quality Gates, etc. -->
+- Every `tasks.md` MUST include test tasks for each user story, written and seen failing
+  before the implementation tasks.
+- Automated tests MUST run headless, without a GPU, a host compositor or input devices.
+  They cover:
+  - protocol conformance through in-process clients: object lifecycles and protocol
+    errors;
+  - canvas and window-management logic: geometry, cameras, placement, focus changes,
+    bindings and actions;
+  - damage tracking;
+  - rendering, by comparing offscreen output (Mesa software renderer) with saved
+    reference images within a tolerance.
+- Behaviour that exists only on real hardware is verified manually: DRM/KMS hotplug and
+  VT switching, driver differences, frame pacing, tearing, VRR, direct scanout, physical
+  input devices, and interop with real clients (XWayland, clipboard and drag-and-drop
+  with browsers). Such code MUST stay a thin layer, and each feature's `quickstart.md`
+  MUST list its manual verification steps.
 
-[SECTION_3_CONTENT]
-<!-- Example: Code review requirements, testing gates, deployment approval process, etc. -->
+Rationale: most compositor logic is deterministic and testable without hardware; keeping
+the hardware-only layer thin keeps the untested surface small.
+
+### IV. A Backend-Independent Core
+
+- The canvas model (geometry, viewers/cameras, placement) MUST be plain data with no
+  Wayland, GL or input-device types, and MUST be fully unit-tested.
+- Backends MUST produce backend-neutral input events and render targets. Nothing above
+  the backend layer may know whether it runs nested or on DRM.
+
+Rationale: the nested backend comes first and DRM/KMS later; the core must not change
+when the backend does.
+
+### V. Contained Unsafe
+
+- `unsafe` is allowed only in the FFI, backend and render modules.
+- Every `unsafe` block MUST carry a `// SAFETY:` comment stating the invariant it relies
+  on.
+- This is enforced by `clippy::undocumented_unsafe_blocks` and an `unsafe_code` lint at
+  the crate root, configured in `Cargo.toml`.
+
+Rationale: FFI to C libraries is unavoidable; confining it keeps memory-safety review
+tractable.
+
+### VI. No Speculative Generality
+
+- A global MUST advertise only the protocol version the feature implements and tests.
+- A trait MAY exist only with two implementations. A test double counts as one only when
+  the real implementation cannot run headless.
+- Configuration options MUST be added only when a spec needs them.
+
+Rationale: unused versions, abstractions and options are untested surface that clients
+and future code will rely on.
+
+### VII. Never Block the Event Loop
+
+- Protocol handlers and frame code MUST NOT do blocking I/O, sleep or wait on another
+  thread.
+- Slow work (spawning processes, reading files, loading config) MUST run off the loop and
+  report back through an event source.
+- Plans MUST name any work that can block.
+
+Rationale: every stall on the loop is a dropped frame or delayed input for the whole
+desktop.
+
+## Technical Constraints
+
+- Language: Rust 1.99, edition 2024, with the toolchain pinned in the repository.
+- Delivery: a single `rubickway` binary. The nested backend (a window inside an existing
+  Wayland session) comes first; the standalone DRM/KMS backend from a TTY comes later.
+- License: MIT for project code; vendored Spec Kit files keep their own MIT notice.
+
+## Quality Gates
+
+- Every `plan.md` MUST pass a Constitution Check against each principle above before
+  design, and again after design. A violation MUST be justified in the plan's Complexity
+  Tracking table or the plan MUST change.
+- Every `spec.md` MUST list its misbehaving-client cases (Principle II).
+- Every `quickstart.md` MUST list manual steps for hardware-only behaviour (Principle
+  III).
+- Lints that enforce Principles II and V MUST live in `Cargo.toml` so the full check
+  enforces them without reviewer memory.
 
 ## Governance
-<!-- Example: Constitution supersedes all other practices; Amendments require documentation, approval, migration plan -->
 
-[GOVERNANCE_RULES]
-<!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
+- This constitution supersedes other project practices. Runtime guidance for agents and
+  contributors (commands, workflow, boundaries, gotchas) lives in `AGENTS.md`; where the
+  two conflict, this constitution wins and `AGENTS.md` is corrected.
+- Amendments are made only through the `speckit-constitution` workflow, only when the
+  project owner asks, and each amendment updates the version and Last Amended date.
+- Versioning follows semantic versioning: MAJOR for removing or redefining a principle,
+  MINOR for adding a principle or materially expanding guidance, PATCH for wording
+  fixes. While the version is 0.x, the constitution is still settling; 1.0.0 marks the
+  first version the owner declares stable.
+- Reviews of specs, plans and code MUST check compliance with these principles.
 
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
-<!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
+**Version**: 0.1.0 | **Ratified**: 2026-11-01 | **Last Amended**: 2026-11-01

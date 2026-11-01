@@ -11,9 +11,11 @@ add only tool-specific extras.
 
 ## Project
 
-**{{PROJECT_NAME}}** - {{ONE_LINE_DESCRIPTION}}
+**RubickWay** - a Wayland compositor with an endless canvas where every monitor is a viewer.
 
-- Stack: {{STACK}} <!-- with versions: "Python 3.13, FastAPI 0.115, PostgreSQL 17" - not "Python API" -->
+- Stack: Rust 1.99, edition 2024 (pinned in `rust-toolchain.toml`), cargo. No database.
+  Dependencies are added per feature; which crates are allowed is in the constitution
+  (Principle I).
 
 ## Commands
 
@@ -21,12 +23,12 @@ Use exactly these - don't invent equivalents.
 
 | Task                                | Command |
 | ----------------------------------- | ------- |
-| Install deps                        | `{{SETUP_CMD}}` <!-- e.g. uv sync or pnpm install or go mod download --> |
-| Run the app                         | `{{RUN_CMD}}` |
-| Format                              | `{{FMT_CMD}}` <!-- e.g. uv run ruff format . or pnpm prettier -w . --> |
-| Run one test                        | `{{SINGLE_TEST_CMD}}` <!-- e.g. uv run pytest tests/test_x.py::test_y -v --> |
-| **Quick check** - while iterating   | `{{QUICK_CHECK_CMD}}` <!-- seconds, not minutes: typecheck + unit tests, e.g. uv run mypy src && uv run pytest -x -q tests/unit --> |
-| **Full check** - before finishing   | `{{FULL_CHECK_CMD}}` <!-- format check + lint + typecheck + all tests; the same command runs in CI --> |
+| Install deps                        | `cargo fetch` |
+| Run the app                         | `cargo run` |
+| Format                              | `cargo fmt` |
+| Run one test                        | `cargo test <module::test_name> -- --exact` |
+| **Quick check** - while iterating   | `cargo clippy --all-targets -- -D warnings && cargo test --lib` |
+| **Full check** - before finishing   | `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked` |
 
 A task isn't finished until the full check passes.
 
@@ -53,19 +55,11 @@ The steps below are Spec Kit skills; invocation depends on the agent (Claude Cod
 - **Feature artifacts** live in `specs/<timestamp>-<name>/` (`spec.md`, `plan.md`, `research.md`,
   `data-model.md`, `contracts/`, `quickstart.md`, `tasks.md`). If implementation has to
   deviate, update the spec/plan first - don't let code and specs drift apart.
-
-## Where the code misleads
-
-<!-- Traps an agent can't spot by reading the code. e.g.
-- `src/legacy/` is still live but deprecated - don't copy its patterns into new code.
-- `src/utils/old_db.py` looks unused but is loaded dynamically by the job runner. -->
-
-## Canonical examples
-
-<!-- The best existing file to copy for each common kind of change. One real example
-     beats paragraphs of description. e.g.
-- New endpoint -> copy `src/api/users.py`, tests in `tests/api/test_users.py`
-- New background job -> copy `src/jobs/cleanup.py` -->
+- **Bug reports** go through the `bug` extension: `speckit-bug-assess` -> `speckit-bug-fix`
+  -> `speckit-bug-test`, with reports in `.specify/bugs/<slug>/`.
+- **Ideas not ready for `specify`** go through the `assess` extension: `speckit-assess-intake`
+  -> `research` -> `define` -> `shape` -> `decide`, in `.specify/assessments/<slug>/`. A `go`
+  verdict hands off to `speckit-specify`.
 
 ## Text style
 
@@ -102,18 +96,24 @@ itself is the point (user-facing copy that needs it, tests for Unicode handling)
 ## Boundaries
 
 - Ask first - unless the approved `plan.md` / `tasks.md` already covers it: adding
-  dependencies, changing public APIs or DB schema, deleting files, touching CI, auth,
+  dependencies, changing public APIs, deleting files, touching CI, auth,
   or anything security-sensitive.
 - Never -> do this instead:
   - Read, print or commit secrets (`.env`, keys) -> use the variable names in `.env.example`.
   - Skip, disable or weaken a failing test -> fix the code, or ask if the test is wrong.
-  - Run destructive commands (`rm -rf`, `git reset --hard`, DB drops) -> ask me.
+  - Run destructive commands (`rm -rf`, `git reset --hard`) -> ask me.
+  - Edit files through shell commands (heredoc `cat > file`, `sed -i`, `tee`, scripts that
+    write files) -> use the agent's file-editing tool, so every change is a reviewable
+    diff. Running shell or Python for anything else (tests, checks, search) is fine.
   - Edit Spec Kit's managed files (`.specify/templates/`, `.specify/scripts/`,
     `.claude/skills/speckit-*`) -> they're overwritten on upgrade; customise via a
     Spec Kit preset, or ask me.
-  <!-- e.g. - Edit generated code in `src/gen/` -> edit `schema.graphql` and run `make gen`. -->
+  - Loosen a lint in `Cargo.toml` or `clippy.toml` -> keep the lint; use a local
+    `#[expect(..., reason = "...")]` or ask me.
 
 ## Gotchas
 
-<!-- Add a line whenever an agent gets something wrong twice. This is how the project
-     "learns". Format: - **Thing**: what to do instead. -->
+- **Lint exceptions**: `unwrap`/`expect`/`panic!` are allowed in tests via `clippy.toml`.
+  Elsewhere use `#[expect(clippy::unwrap_used, reason = "...")]`, never `#[allow(clippy::...)]`. A
+  module that needs `unsafe` opts in with `#![allow(unsafe_code)]`, and only FFI, backend
+  and render modules may (constitution, Principle V).
