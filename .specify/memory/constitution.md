@@ -44,8 +44,9 @@ untrusted input.
   - canvas and window-management logic: geometry, cameras, placement, focus changes,
     bindings and actions;
   - damage tracking;
-  - rendering, by comparing offscreen output (Mesa software renderer) with saved
-    reference images within a tolerance.
+  - rendering, by reading back offscreen output (Mesa software renderer) and asserting
+    expected pixel facts - positions, spacing and colours computed from the inputs, within a
+    tolerance; no reference images are stored in the repository.
 - Behaviour that exists only on real hardware is verified manually: DRM/KMS hotplug and
   VT switching, driver differences, frame pacing, tearing, VRR, direct scanout, physical
   input devices, and interop with real clients (XWayland, clipboard and drag-and-drop
