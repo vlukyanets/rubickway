@@ -117,8 +117,8 @@ itself is the point (user-facing copy that needs it, tests for Unicode handling)
   `clippy.toml`, but not in helper functions of integration tests - those crates declare a
   crate-level `#![expect(..., reason = "...")]`. Elsewhere use
   `#[expect(clippy::unwrap_used, reason = "...")]`, never `#[allow(clippy::...)]`. A module
-  that needs `unsafe` opts in with `#![allow(unsafe_code)]`, and only FFI, backend and
-  render modules may (constitution, Principle V).
+  that needs `unsafe` opts in with `#![allow(unsafe_code)]`, and only FFI, backend, render
+  and plugin loader modules may (constitution, Principle V).
 - **Rendering tests** (`tests/render_grid.rs`) read back llvmpipe output and assert pixel
   facts computed from the inputs (`renders_on_llvmpipe` guards the renderer). After an
   intended visual change, update the expected values - colours come from the `render`

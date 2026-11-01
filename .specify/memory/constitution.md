@@ -68,7 +68,7 @@ when the backend does.
 
 ### V. Contained Unsafe
 
-- `unsafe` is allowed only in the FFI, backend and render modules.
+- `unsafe` is allowed only in the FFI, backend, render and plugin loader modules.
 - Every `unsafe` block MUST carry a `// SAFETY:` comment stating the invariant it relies
   on.
 - This is enforced by `clippy::undocumented_unsafe_blocks` and an `unsafe_code` lint at
@@ -98,11 +98,36 @@ and future code will rely on.
 Rationale: every stall on the loop is a dropped frame or delayed input for the whole
 desktop.
 
+### VIII. A 2D Core with Plugins
+
+- The core is the 2D infinite-canvas compositor. It MUST run fully with no plugins
+  installed and MUST NOT depend on any plugin.
+- Optional features (3D, shader effects, ...) are in-process plugins: shared libraries loaded
+  at startup from the plugin directory (`/usr/lib/rubickway/plugins/`), each packaged
+  separately as `rubickway-features-<name>`.
+- Plugins are first-party only: they live in this repository, are built together with the
+  core from the same source tree using the Rust interface, and their packages pin the exact
+  core version. A stable, versioned C ABI for third-party plugins MAY be added later, only by
+  amendment and when there is demand.
+- The plugin interface and loader MUST be designed together with the first plugin, not
+  before (Principle VI).
+- Plugins are trusted code in the compositor process and follow the same rules as core code
+  (Principles II, V, VII). A panic inside a plugin MUST be caught at the plugin boundary and
+  disable that plugin instead of taking the compositor down.
+
+Rationale: a small core stays understandable and testable, while heavy or experimental
+features can be installed only by those who want them. Without a stable Rust ABI, building
+plugins together with the core is the only reliable way to load Rust code at runtime.
+
 ## Technical Constraints
 
 - Language: Rust 1.99, edition 2024, with the toolchain pinned in the repository.
-- Delivery: a single `rubickway` binary. The nested backend (a window inside an existing
-  Wayland session) comes first; the standalone DRM/KMS backend from a TTY comes later.
+- Delivery: a `rubickway` binary plus optional plugin libraries. The nested backend (a window
+  inside an existing Wayland session) comes first; the standalone DRM/KMS backend from a TTY
+  comes later.
+- Packaging: the core package `rubickway` and plugin packages `rubickway-features-<name>`,
+  all built from the same source (on Arch: one PKGBUILD with split packages, plugins
+  depending on `rubickway=$pkgver`).
 - License: MIT for project code; vendored Spec Kit files keep their own MIT notice.
 
 ## Quality Gates
@@ -122,11 +147,11 @@ desktop.
   contributors (commands, workflow, boundaries, gotchas) lives in `AGENTS.md`; where the
   two conflict, this constitution wins and `AGENTS.md` is corrected.
 - Amendments are made only through the `speckit-constitution` workflow, only when the
-  project owner asks, and each amendment updates the version and Last Amended date.
-- Versioning follows semantic versioning: MAJOR for removing or redefining a principle,
-  MINOR for adding a principle or materially expanding guidance, PATCH for wording
-  fixes. While the version is 0.x, the constitution is still settling; 1.0.0 marks the
-  first version the owner declares stable.
+  project owner asks; each amendment updates the Last Amended date.
+- The version changes only when the owner decides. A bump follows semantic versioning:
+  MAJOR for removing or redefining a principle, MINOR for adding a principle or materially
+  expanding guidance, PATCH for wording fixes. While the version is 0.x, the constitution is
+  still settling; 1.0.0 marks the first version the owner declares stable.
 - Reviews of specs, plans and code MUST check compliance with these principles.
 
 **Version**: 0.1.0 | **Ratified**: 2026-11-01 | **Last Amended**: 2026-11-01
