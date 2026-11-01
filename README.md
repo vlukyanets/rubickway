@@ -13,7 +13,11 @@ Status: early skeleton - no compositor features yet.
 
 - [rustup](https://rustup.rs/) - the toolchain (Rust 1.99) is pinned in
   `rust-toolchain.toml` and installed automatically.
-- A Wayland session, to run the nested compositor (once it exists).
+- System libraries: libwayland-client, libwayland-egl, libEGL with Mesa, libGLESv2,
+  libxkbcommon and xkeyboard-config. On Arch: `wayland`, `mesa`, `libglvnd`,
+  `libxkbcommon`, `xkeyboard-config`. On Debian/Ubuntu: `libwayland-dev`,
+  `libxkbcommon-dev`, `libegl-dev`, `libgles-dev`, `libegl-mesa0`, `xkb-data`.
+- A Wayland session, to run the nested compositor.
 
 ## Setup, run, test
 

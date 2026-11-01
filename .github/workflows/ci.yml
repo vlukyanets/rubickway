@@ -15,5 +15,10 @@ jobs:
       - uses: actions/checkout@v7
       # Installs the toolchain and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
+      # System libraries: Wayland and xkbcommon to link, EGL/GLES + Mesa (llvmpipe) for the
+      # rendering tests, xkb-data for the keymap tests.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev libegl-dev libgles-dev libegl-mesa0 xkb-data
       - run: cargo fetch --locked
       - run: cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked
