@@ -224,6 +224,14 @@ impl WaylandHost {
         self.state.window.request_frame(&qh);
     }
 
+    /// Asks for a frame callback without drawing: an empty commit (research R12, used when
+    /// only applications wait for a frame).
+    pub fn request_empty_frame(&mut self) {
+        let qh = self.queue.handle();
+        self.state.window.request_frame(&qh);
+        self.state.window.commit();
+    }
+
     /// Sets the pointer cursor shown over the viewer.
     pub fn set_cursor(&mut self, cursor: Cursor) {
         self.state.seat.set_cursor(cursor);

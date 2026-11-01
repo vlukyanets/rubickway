@@ -11,20 +11,24 @@ publish = false
 calloop = { version = "0.14", features = ["signals"] }
 glow = "0.18"
 khronos-egl = { version = "6", features = ["static"] }
+libc = "0.2"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
 wayland-egl = "0.32"
-wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols = { version = "0.32", features = ["client", "server", "staging", "unstable"] }
+# `libwayland_1_23` only unlocks the per-client buffer limit API (research R8); with the
+# pure-Rust backend it links no system library.
+wayland-server = { version = "0.31", features = ["libwayland_1_23"] }
 xkbcommon = "0.9"
 
 [dev-dependencies]
 proptest = "1"
 
 [lints.rust]
-# Principle V: unsafe only in FFI, backend and render modules, which opt in with
+# Principle V: unsafe only in FFI, backend, render and plugin loader modules, which opt in with
 # #[allow(unsafe_code)] on the module.
 unsafe_code = "deny"
 

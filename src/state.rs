@@ -1,26 +1,36 @@
-//! The application: the host backend, the viewer and the renderer on one event loop.
+//! The application: the host backend, the Wayland server for applications, the shell and the
+//! renderer on one event loop.
 //!
-//! Frame scheduling (data-model.md): a frame is drawn only when the viewer is dirty, the
-//! window is configured and no frame callback is pending. Hosts stop sending frame callbacks
-//! for hidden windows, so hidden windows cost no frames.
+//! Frame scheduling (data-model.md): a frame is drawn only when the view or a window changed,
+//! the viewer window is configured and no host frame callback is pending. Hosts stop sending
+//! frame callbacks for hidden windows, so hidden windows cost no frames, and applications are
+//! only told to draw when the host presented a frame that showed them (research R12).
+
+use std::ffi::OsString;
+use std::time::Instant;
 
 use calloop::generic::Generic;
 use calloop::signals::{Signal, Signals};
 use calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use khronos_egl as egl;
 use thiserror::Error;
+use wayland_server::ListeningSocket;
 
 use crate::backend::BackendEvent;
 use crate::backend::wayland_host::{Cursor, HostError, WaylandHost};
+use crate::canvas::Point;
 use crate::render::egl::{Egl, EglError};
-use crate::render::{GlesRenderer, RenderError};
-use crate::viewer::Viewer;
+use crate::render::{GlesRenderer, ImageRef, Quad, RenderError};
+use crate::server::{Server, ServerError};
+use crate::shell::{Shell, WindowId};
 
 /// Why the application stopped with an error. Messages follow `contracts/cli.md`.
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error(transparent)]
     Host(#[from] HostError),
+    #[error(transparent)]
+    Server(#[from] ServerError),
     #[error("cannot initialise OpenGL ES: {0}")]
     Init(String),
     #[error("rendering failed: {0}")]
@@ -54,18 +64,27 @@ struct App {
     target: Option<Target>,
     egl: Egl,
     host: WaylandHost,
-    viewer: Viewer,
+    server: Server,
+    /// Kept for its lifetime: dropping it removes the socket and its lock file.
+    listener: ListeningSocket,
+    shell: Shell,
     configured: bool,
     frame_pending: bool,
+    /// Windows shown in the frame the host has not presented yet.
+    shown: Vec<WindowId>,
+    started: Instant,
     cursor: Cursor,
     signal: LoopSignal,
     error: Option<AppError>,
 }
 
-/// Runs the nested viewer until the user quits, the window is closed or a signal arrives.
+/// Runs the nested compositor until the user quits, the window is closed or a signal arrives.
 pub fn run() -> Result<(), AppError> {
     let host = WaylandHost::connect()?;
     let egl = Egl::wayland(host.connection()).map_err(|e| AppError::Init(e.to_string()))?;
+    let mut server = Server::new()?;
+    let (listener, name) = Server::listen()?;
+    announce_socket(&name);
 
     let mut event_loop: EventLoop<App> =
         EventLoop::try_new().map_err(|e| AppError::Loop(e.to_string()))?;
@@ -78,6 +97,34 @@ pub fn run() -> Result<(), AppError> {
             |_, _, app| {
                 if let Err(err) = app.host.read() {
                     app.fail(err.into());
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| AppError::Loop(e.to_string()))?;
+
+    let listen_fd = std::os::fd::AsFd::as_fd(&listener)
+        .try_clone_to_owned()
+        .map_err(|e| AppError::Loop(e.to_string()))?;
+    handle
+        .insert_source(
+            Generic::new(listen_fd, Interest::READ, Mode::Level),
+            |_, _, app| {
+                app.accept_clients();
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| AppError::Loop(e.to_string()))?;
+
+    let server_fd = server
+        .poll_fd()
+        .map_err(|e| AppError::Loop(e.to_string()))?;
+    handle
+        .insert_source(
+            Generic::new(server_fd, Interest::READ, Mode::Level),
+            |_, _, app| {
+                if let Err(err) = app.server.dispatch() {
+                    app.fail(AppError::Loop(format!("serving applications: {err}")));
                 }
                 Ok(PostAction::Continue)
             },
@@ -97,9 +144,13 @@ pub fn run() -> Result<(), AppError> {
         target: None,
         egl,
         host,
-        viewer: Viewer::new(),
+        server,
+        listener,
+        shell: Shell::new(),
         configured: false,
         frame_pending: false,
+        shown: Vec::new(),
+        started: Instant::now(),
         cursor: Cursor::Default,
         signal: event_loop.get_signal(),
         error: None,
@@ -116,12 +167,36 @@ pub fn run() -> Result<(), AppError> {
     }
 }
 
+fn announce_socket(name: &OsString) {
+    tracing::info!(
+        "applications can connect with WAYLAND_DISPLAY={}",
+        name.to_string_lossy()
+    );
+}
+
 impl App {
     fn fail(&mut self, err: AppError) {
         if self.error.is_none() {
             self.error = Some(err);
         }
         self.signal.stop();
+    }
+
+    fn accept_clients(&mut self) {
+        loop {
+            match self.listener.accept() {
+                Ok(Some(stream)) => {
+                    if let Err(err) = self.server.insert_client(stream) {
+                        tracing::warn!("cannot serve a new application: {err}");
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!("accepting an application failed: {err}");
+                    break;
+                }
+            }
+        }
     }
 
     /// Runs after every loop dispatch, before sleeping: handle queued events, draw if needed,
@@ -146,11 +221,33 @@ impl App {
         loop {
             self.host.dispatch_pending()?;
             self.handle_events();
+            for event in self.server.take_window_events() {
+                let inputs = self.shell.apply(event);
+                self.server.deliver(&inputs, self.now_ms());
+            }
             self.update_cursor();
-            if self.configured && !self.frame_pending && self.viewer.take_dirty() {
-                self.render()?;
+            let viewer = self.shell.viewer();
+            self.server.set_viewer(viewer.buffer_size(), viewer.scale());
+            self.upload_content()?;
+            if self.configured && !self.frame_pending {
+                let dirty = self.shell.take_dirty() | self.server.take_dirty();
+                if dirty {
+                    self.render()?;
+                } else {
+                    let visible = self.shell.visible();
+                    if self.server.has_pending_callbacks(&visible) {
+                        // Applications wait for a frame but nothing changed: ask the host for a
+                        // frame callback without drawing.
+                        self.host.request_empty_frame();
+                        self.shown = visible;
+                        self.frame_pending = true;
+                    }
+                }
             }
             self.host.flush()?;
+            if let Err(err) = self.server.flush() {
+                tracing::warn!("sending to applications failed: {err}");
+            }
             // Fails when events arrived meanwhile (e.g. read by EGL during the swap): handle
             // them first.
             if self.host.prepare_read() {
@@ -163,27 +260,40 @@ impl App {
         for event in self.host.take_events() {
             match event {
                 BackendEvent::Input(input) => {
-                    if self.viewer.handle(&input).quit {
+                    let (effect, inputs) = self.shell.handle(&input);
+                    self.server.deliver(&inputs, self.now_ms());
+                    if effect.quit {
                         tracing::info!("quit requested");
                         self.signal.stop();
                     }
                 }
                 BackendEvent::Configure { size } => {
-                    self.viewer.configure(size);
+                    self.shell.viewer_mut().configure(size);
                     self.configured = true;
                 }
-                BackendEvent::Scale(scale) => self.viewer.set_scale(scale),
-                BackendEvent::FrameDone => self.frame_pending = false,
+                BackendEvent::Scale(scale) => self.shell.viewer_mut().set_scale(scale),
+                BackendEvent::FrameDone => {
+                    self.frame_pending = false;
+                    let shown = std::mem::take(&mut self.shown);
+                    self.server.presented(self.now_ms(), &shown);
+                }
                 BackendEvent::CloseRequested => {
                     tracing::info!("window closed by the host");
                     self.signal.stop();
                 }
+                BackendEvent::Keymap(text) => self.server.set_keymap(&text),
+                BackendEvent::RepeatInfo { rate, delay } => self.server.set_repeat(rate, delay),
             }
         }
     }
 
+    /// Milliseconds since startup, wrapping: the clock of frame callbacks and input events.
+    fn now_ms(&self) -> u32 {
+        self.started.elapsed().as_millis() as u32
+    }
+
     fn update_cursor(&mut self) {
-        let wanted = if self.viewer.is_panning() {
+        let wanted = if self.shell.viewer().is_panning() {
             Cursor::Grabbing
         } else {
             Cursor::Default
@@ -194,13 +304,84 @@ impl App {
         }
     }
 
+    /// Copies newly committed buffers into textures and frees textures of destroyed surfaces.
+    /// Needs the GL context, so it waits until the first frame created it.
+    fn upload_content(&mut self) -> Result<(), AppError> {
+        let Some(target) = &mut self.target else {
+            return Ok(());
+        };
+        self.egl.make_current(Some(target.surface))?;
+        let renderer = &mut target.renderer;
+        self.server.upload_pending(|key, image| {
+            let image = ImageRef {
+                bytes: image.bytes,
+                width: image.width,
+                height: image.height,
+                stride: image.stride,
+                opaque: image.opaque,
+            };
+            if let Err(err) = renderer.upload(key.0, image) {
+                tracing::warn!("cannot upload window content: {err}");
+            }
+        });
+        for key in self.server.take_destroyed_surfaces() {
+            renderer.remove(key.0);
+        }
+        Ok(())
+    }
+
+    /// The window surfaces to draw, back to front, in physical pixels of the buffer.
+    fn window_quads(&self) -> (Vec<Quad>, Vec<WindowId>) {
+        let viewer = self.shell.viewer();
+        let camera = viewer.camera();
+        let size = viewer.size();
+        let scale = viewer.render_scale();
+        let visible = self.shell.visible();
+        let mut quads = Vec::new();
+        for id in &visible {
+            let Some(window) = self.shell.windows().get(*id) else {
+                continue;
+            };
+            for part in self.server.window_parts(*id) {
+                if !part.has_content {
+                    continue;
+                }
+                // Window coordinates are canvas units relative to the window origin.
+                let top_left = Point::new(
+                    window.origin.x + part.rect.origin.x,
+                    window.origin.y + part.rect.origin.y,
+                );
+                let p = camera.to_logical(top_left, size);
+                let factor = camera.zoom * scale;
+                quads.push(Quad {
+                    key: part.key.0,
+                    dst: [
+                        (p.x * scale) as f32,
+                        (p.y * scale) as f32,
+                        (part.rect.size.w * factor) as f32,
+                        (part.rect.size.h * factor) as f32,
+                    ],
+                    src: [
+                        part.src.origin.x as f32,
+                        part.src.origin.y as f32,
+                        part.src.size.w as f32,
+                        part.src.size.h as f32,
+                    ],
+                    transform: part.transform,
+                });
+            }
+        }
+        (quads, visible)
+    }
+
     fn render(&mut self) -> Result<(), AppError> {
         if self.target.is_none() {
             // The window surface exists before the GPU limit is known; buffers are only
             // allocated at the first draw, after the resize below applies the limit.
-            let window = self
-                .host
-                .egl_window(self.viewer.buffer_size(), self.viewer.size())?;
+            let window = self.host.egl_window(
+                self.shell.viewer().buffer_size(),
+                self.shell.viewer().size(),
+            )?;
             let surface = self
                 .egl
                 .create_window_surface(window)
@@ -213,22 +394,30 @@ impl App {
                 .map_err(|e| AppError::Init(e.to_string()))?;
             let renderer =
                 GlesRenderer::new(self.egl.load_gl()).map_err(|e| AppError::Init(e.to_string()))?;
-            self.viewer.set_max_buffer_side(renderer.max_buffer_side());
-            self.viewer.take_dirty();
+            self.shell
+                .viewer_mut()
+                .set_max_buffer_side(renderer.max_buffer_side());
+            self.server
+                .set_max_texture_side(renderer.max_texture_side());
+            self.shell.take_dirty();
             self.target = Some(Target { surface, renderer });
+            // Content committed before the context existed.
+            self.upload_content()?;
         }
-        let buffer = self.viewer.buffer_size();
-        self.host.egl_window(buffer, self.viewer.size())?;
+        let buffer = self.shell.viewer().buffer_size();
+        self.host.egl_window(buffer, self.shell.viewer().size())?;
+        let (quads, visible) = self.window_quads();
         let Some(target) = &self.target else {
             return Ok(());
         };
         self.egl.make_current(Some(target.surface))?;
-        target
-            .renderer
-            .draw(&self.viewer.grid_params(), buffer.0, buffer.1);
+        let grid = self.shell.viewer().grid_params();
+        target.renderer.draw(&grid, buffer.0, buffer.1);
+        target.renderer.draw_windows(&quads, buffer.0, buffer.1);
         self.host.request_frame();
         self.egl.swap_buffers(target.surface)?;
         self.frame_pending = true;
+        self.shown = visible;
         Ok(())
     }
 }

@@ -16,7 +16,7 @@ use super::{Globals, HostState};
 use crate::backend::BackendEvent;
 use crate::canvas::{Point, Vector};
 use crate::input::keyboard::Keyboard;
-use crate::input::{Button, InputEvent, ScrollSource};
+use crate::input::{Button, InputEvent, RawModifiers, ScrollSource};
 
 /// Linux input event codes for pointer buttons.
 const BTN_LEFT: u32 = 0x110;
@@ -198,13 +198,16 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for HostState {
                     return;
                 }
                 let file = File::from(fd);
-                state.seat.xkb = read_keymap(&file, size).and_then(|text| {
-                    let keyboard = Keyboard::from_keymap_string(text);
-                    if keyboard.is_none() {
-                        tracing::warn!("the host keymap does not compile");
-                    }
-                    keyboard
-                });
+                let Some(text) = read_keymap(&file, size) else {
+                    state.seat.xkb = None;
+                    return;
+                };
+                state.seat.xkb = Keyboard::from_keymap_string(text.clone());
+                match state.seat.xkb {
+                    // Applications get the same keymap (research R11).
+                    Some(_) => state.push(BackendEvent::Keymap(text)),
+                    None => tracing::warn!("the host keymap does not compile"),
+                }
             }
             wl_keyboard::Event::Key {
                 key,
@@ -217,10 +220,14 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for HostState {
                 input(
                     state,
                     InputEvent::Key {
+                        keycode: key,
                         binding_sym,
                         pressed,
                     },
                 );
+            }
+            wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                state.push(BackendEvent::RepeatInfo { rate, delay });
             }
             wl_keyboard::Event::Modifiers {
                 mods_depressed,
@@ -233,10 +240,17 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for HostState {
                     return;
                 };
                 let mods = xkb.update_mask(mods_depressed, mods_latched, mods_locked, group);
-                input(state, InputEvent::Modifiers { mods });
+                let raw = RawModifiers {
+                    depressed: mods_depressed,
+                    latched: mods_latched,
+                    locked: mods_locked,
+                    group,
+                };
+                input(state, InputEvent::Modifiers { mods, raw });
             }
             wl_keyboard::Event::Leave { .. } => input(state, InputEvent::FocusLost),
-            // Enter: modifiers follow in their own event. Repeat info: no key repeat.
+            // Modifiers follow in their own event.
+            wl_keyboard::Event::Enter { .. } => input(state, InputEvent::FocusGained),
             _ => {}
         }
     }
@@ -280,14 +294,21 @@ impl Dispatch<wl_pointer::WlPointer, ()> for HostState {
                 state: button_state,
                 ..
             } => {
-                let button = match button {
+                let kind = match button {
                     BTN_LEFT => Button::Left,
                     BTN_RIGHT => Button::Right,
                     BTN_MIDDLE => Button::Middle,
                     other => Button::Other(other),
                 };
                 let pressed = button_state == WEnum::Value(wl_pointer::ButtonState::Pressed);
-                input(state, InputEvent::PointerButton { button, pressed });
+                input(
+                    state,
+                    InputEvent::PointerButton {
+                        button: kind,
+                        code: button,
+                        pressed,
+                    },
+                );
             }
             wl_pointer::Event::AxisSource {
                 axis_source: WEnum::Value(source),

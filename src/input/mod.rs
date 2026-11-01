@@ -18,8 +18,12 @@ pub enum InputEvent {
     PointerMotion { pos: Point },
     /// The pointer left the viewer.
     PointerLeave,
-    /// A pointer button changed state.
-    PointerButton { button: Button, pressed: bool },
+    /// A pointer button changed state. `code` is its Linux input event code.
+    PointerButton {
+        button: Button,
+        code: u32,
+        pressed: bool,
+    },
     /// One scroll frame. `delta` in logical pixels, positive `y` = scroll down, as delivered by
     /// the host (natural scrolling already applied). `value120` is set for wheels: one notch is
     /// 120, high-resolution wheels report fractions of it.
@@ -34,13 +38,30 @@ pub enum InputEvent {
     PinchUpdate { scale: f64 },
     /// The pinch ended or was cancelled.
     PinchEnd { cancelled: bool },
-    /// A key changed state. `binding_sym` is the key's symbol in the first layout at the base
-    /// level, so shortcuts work whatever layout is active.
-    Key { binding_sym: Keysym, pressed: bool },
-    /// The effective modifiers changed.
-    Modifiers { mods: Modifiers },
+    /// A key changed state. `keycode` is the Linux evdev key code; `binding_sym` is the key's
+    /// symbol in the first layout at the base level, so shortcuts work whatever layout is
+    /// active.
+    Key {
+        keycode: u32,
+        binding_sym: Keysym,
+        pressed: bool,
+    },
+    /// The modifiers changed: `mods` are the effective ones, `raw` the masks as the host sent
+    /// them (forwarded to applications).
+    Modifiers { mods: Modifiers, raw: RawModifiers },
     /// The viewer lost keyboard or pointer focus.
     FocusLost,
+    /// The viewer got the keyboard (back).
+    FocusGained,
+}
+
+/// Modifier and layout state as xkb masks, forwarded unchanged to applications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RawModifiers {
+    pub depressed: u32,
+    pub latched: u32,
+    pub locked: u32,
+    pub group: u32,
 }
 
 /// A pointer button.

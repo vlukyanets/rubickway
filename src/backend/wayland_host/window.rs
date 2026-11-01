@@ -116,6 +116,11 @@ impl Window {
         self.surface.frame(qh, ());
     }
 
+    /// Commits the surface without new content (sends a pending frame request).
+    pub fn commit(&self) {
+        self.surface.commit();
+    }
+
     pub fn drop_egl_window(&mut self) {
         self.egl = None;
         self.applied = None;
