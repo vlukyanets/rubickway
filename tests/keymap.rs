@@ -12,6 +12,7 @@ use xkbcommon::xkb;
 /// Linux evdev key codes.
 const KEY_Q: u32 = 16;
 const KEY_0: u32 = 11;
+const KEY_TAB: u32 = 15;
 
 struct Setup {
     keyboard: Keyboard,
@@ -117,6 +118,51 @@ fn mod_shift_q_is_quit() {
     };
     assert_eq!(bindings::lookup(with_ctrl, Keysym::q, true), None);
     assert_eq!(bindings::lookup(Modifiers::NONE, Keysym::q, true), None);
+}
+
+#[test]
+fn mod_q_closes_and_mod_shift_q_quits() {
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::NONE
+    };
+    assert_eq!(
+        bindings::lookup(alt, Keysym::q, true),
+        Some(Action::CloseWindow)
+    );
+    let alt_shift = Modifiers { shift: true, ..alt };
+    assert_eq!(
+        bindings::lookup(alt_shift, Keysym::q, true),
+        Some(Action::Quit)
+    );
+}
+
+#[test]
+fn mod_tab_and_mod_shift_tab_cycle_windows() {
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::NONE
+    };
+    let alt_shift = Modifiers { shift: true, ..alt };
+    assert_eq!(
+        bindings::lookup(alt, Keysym::Tab, true),
+        Some(Action::NextWindow)
+    );
+    assert_eq!(
+        bindings::lookup(alt_shift, Keysym::Tab, true),
+        Some(Action::PreviousWindow)
+    );
+    assert_eq!(bindings::lookup(Modifiers::NONE, Keysym::Tab, true), None);
+    assert_eq!(bindings::lookup(alt, Keysym::Tab, false), None);
+}
+
+#[test]
+fn shift_tab_reports_tab_as_its_binding_symbol() {
+    // Shift+Tab produces ISO_Left_Tab at level 1; bindings use the level-0 symbol.
+    let mut s = Setup::new("us");
+    let shift = s.mask(&[xkb::MOD_NAME_SHIFT]);
+    s.keyboard.update_mask(shift, 0, 0, 0);
+    assert_eq!(s.keyboard.binding_sym(KEY_TAB), Keysym::Tab);
 }
 
 #[test]

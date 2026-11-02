@@ -28,6 +28,15 @@ const BTN_MIDDLE: u32 = 0x112;
 pub enum Cursor {
     Default,
     Grabbing,
+    Move,
+    ResizeN,
+    ResizeNE,
+    ResizeE,
+    ResizeSE,
+    ResizeS,
+    ResizeSW,
+    ResizeW,
+    ResizeNW,
 }
 
 /// Axis events collected until `wl_pointer.frame`.
@@ -74,9 +83,19 @@ impl Seat {
 
     fn apply_cursor(&self) {
         if let (Some(device), Some(serial)) = (&self.cursor_device, self.enter_serial) {
+            use wp_cursor_shape_device_v1::Shape;
             let shape = match self.cursor {
-                Cursor::Default => wp_cursor_shape_device_v1::Shape::Default,
-                Cursor::Grabbing => wp_cursor_shape_device_v1::Shape::Grabbing,
+                Cursor::Default => Shape::Default,
+                Cursor::Grabbing => Shape::Grabbing,
+                Cursor::Move => Shape::Move,
+                Cursor::ResizeN => Shape::NResize,
+                Cursor::ResizeNE => Shape::NeResize,
+                Cursor::ResizeE => Shape::EResize,
+                Cursor::ResizeSE => Shape::SeResize,
+                Cursor::ResizeS => Shape::SResize,
+                Cursor::ResizeSW => Shape::SwResize,
+                Cursor::ResizeW => Shape::WResize,
+                Cursor::ResizeNW => Shape::NwResize,
             };
             device.set_shape(serial, shape);
         }

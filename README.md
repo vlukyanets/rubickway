@@ -30,7 +30,7 @@ cargo test     # test
 The full check, the same as CI:
 
 ```sh
-cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked
+cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked && cargo test --release --locked
 ```
 
 ## Running applications on RubickWay
@@ -48,6 +48,27 @@ renderer:
 ```sh
 WAYLAND_DISPLAY=wayland-2 LIBGL_ALWAYS_SOFTWARE=1 kitty
 ```
+
+## Controls
+
+Mod is Alt while RubickWay runs nested. Everything else goes to the application under the
+pointer or with keyboard focus.
+
+| Input | Effect |
+| --- | --- |
+| Alt + left-drag (anywhere), left-drag on the background | pan the canvas |
+| Alt + scroll, pinch, wheel over the background | zoom around the pointer |
+| touchpad scroll over the background | pan the canvas |
+| Alt + Shift + left-drag on a window, or drag its title bar | move the window |
+| Alt + right-drag on a window, or drag its border | resize it from the nearest edge or corner |
+| Alt+Tab / Alt+Shift+Tab | focus the next / previous window and bring it into view |
+| Alt+Q | ask the focused window to close |
+| Alt+0 | back to the canvas origin at 100% |
+| Alt+Shift+Q | quit RubickWay |
+
+Applications' own maximize and fullscreen controls work: maximize moves the view to the window
+at 100% and fills the viewer; fullscreen shows only that window, and panning, zooming or
+Alt+Tab leaves it.
 
 ## Development workflow
 

@@ -4,11 +4,13 @@
 
 use std::os::fd::AsFd;
 
-use rubickway::shell::{WindowEvent, WindowId};
+use rubickway::canvas::Size;
+use rubickway::shell::{States, WindowCommand, WindowEvent, WindowId};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_surface;
 use wayland_client::{Connection, Proxy};
+use wayland_protocols::xdg::shell::client::xdg_toplevel;
 
 use crate::harness::{Harness, solid_buffer, temp_file};
 use crate::surfaces::{Window, globals, open_window};
@@ -245,5 +247,129 @@ fn case_7_a_buffer_above_the_texture_limit_disconnects() {
     let error = h.c(ci).error().expect("disconnected with an error");
     assert_eq!(error.code, wl_surface::Error::InvalidSize as u32);
     assert_eq!(error.object_interface, "wl_surface");
+    assert_good_client_works(&mut h, &good);
+}
+
+// --- Window management (window-management spec Edge Cases, SC-006) ----------------------------
+//
+// Shell-level cases (requests without a press, windows disappearing mid-operation or while
+// maximized or fullscreen, requests from unfocused windows, limits above the largest window)
+// are in tests/shell.rs; stale serials and unknown resize edges in tests/protocol/wm.rs.
+
+fn configure(window: WindowId, w: f64, h: f64) -> WindowCommand {
+    WindowCommand::Configure {
+        window,
+        size: Some(Size::new(w, h)),
+        states: States::default(),
+    }
+}
+
+#[test]
+fn contradictory_size_limits_are_reported_as_sent() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let ci = h.connect();
+    let g = globals(h.c(ci));
+    let (w, _id) = open_window(&mut h, ci, &g, 20, 20, RED);
+    w.toplevel.set_min_size(300, 300);
+    w.toplevel.set_max_size(100, 100);
+    w.surface.commit();
+    h.roundtrip();
+    let limits = h
+        .server
+        .take_window_events()
+        .into_iter()
+        .find_map(|e| match e {
+            WindowEvent::Updated { limits, .. } => Some(limits),
+            _ => None,
+        })
+        .expect("limits reported");
+    // The shell resolves the conflict (SizeLimits::clamp); the server keeps the values.
+    assert_eq!(limits.min, Size::new(300.0, 300.0));
+    assert_eq!(limits.max, Size::new(100.0, 100.0));
+    assert!(!h.c(ci).is_disconnected());
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn a_client_that_never_acks_keeps_one_configure_outstanding() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let ci = h.connect();
+    let g = globals(h.c(ci));
+    let (w, id) = open_window(&mut h, ci, &g, 20, 20, RED);
+    h.c(ci).clear_events();
+    for i in 0..50 {
+        h.server
+            .command(&[configure(id, 100.0 + f64::from(i), 100.0)]);
+        h.roundtrip();
+    }
+    let sent = h
+        .c(ci)
+        .events::<xdg_toplevel::Event>()
+        .into_iter()
+        .filter(|(oid, e)| {
+            *oid == w.toplevel.id() && matches!(e, xdg_toplevel::Event::Configure { .. })
+        })
+        .count();
+    assert_eq!(sent, 1);
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn a_toplevel_destroyed_while_its_initial_configure_is_held_is_forgotten() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let ci = h.connect();
+    let g = globals(h.c(ci));
+    let qh = h.c(ci).qh.clone();
+    let surface = g.compositor.create_surface(&qh, ());
+    let xdg = g.wm_base.get_xdg_surface(&surface, &qh, ());
+    let toplevel = xdg.get_toplevel(&qh, ());
+    toplevel.set_fullscreen(None);
+    surface.commit();
+    h.roundtrip();
+    let id = h
+        .server
+        .take_window_events()
+        .into_iter()
+        .find_map(|e| match e {
+            WindowEvent::Created { id, .. } => Some(id),
+            _ => None,
+        })
+        .expect("created");
+    toplevel.destroy();
+    xdg.destroy();
+    h.roundtrip();
+    assert_eq!(
+        h.server.take_window_events(),
+        vec![WindowEvent::Unmapped { id }]
+    );
+    // The shell's late answer is ignored.
+    h.server.command(&[configure(id, 100.0, 100.0)]);
+    h.roundtrip();
+    assert!(!h.c(ci).is_disconnected());
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn a_client_gone_with_a_configure_queued_harms_no_one() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let ci = h.connect();
+    let g = globals(h.c(ci));
+    let (_w, id) = open_window(&mut h, ci, &g, 20, 20, RED);
+    h.server.command(&[configure(id, 100.0, 100.0)]);
+    h.server.command(&[configure(id, 200.0, 200.0)]);
+    let gone = h.clients.remove(ci);
+    drop(gone);
+    h.roundtrip();
+    assert!(
+        h.server
+            .take_window_events()
+            .contains(&WindowEvent::Unmapped { id })
+    );
+    h.server.command(&[configure(id, 300.0, 300.0)]);
+    h.roundtrip();
     assert_good_client_works(&mut h, &good);
 }

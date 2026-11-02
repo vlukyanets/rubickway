@@ -28,7 +28,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::{Display, DisplayHandle, ListeningSocket};
 
 use crate::canvas::{Point, Rect};
-use crate::shell::{ClientInput, WindowEvent, WindowId};
+use crate::shell::{ClientInput, WindowCommand, WindowEvent, WindowId};
 
 pub use compositor::Transform;
 
@@ -310,6 +310,11 @@ impl Server {
                 .get(id)
                 .is_some_and(|root| compositor::has_callbacks(&self.state, root))
         })
+    }
+
+    /// Applies the shell's window commands: configures and close requests (research W1).
+    pub fn command(&mut self, commands: &[WindowCommand]) {
+        xdg_shell::command(&mut self.state, commands);
     }
 
     /// Delivers the shell's input decisions to the applications. `time_ms` is the

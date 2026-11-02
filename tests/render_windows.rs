@@ -224,3 +224,35 @@ fn thin_lines_shrunk_to_25_percent_read_as_even_grey() {
         }
     }
 }
+
+#[test]
+fn a_fullscreen_window_is_drawn_alone_on_black() {
+    let red = solid(120, 80, 0xffff_0000);
+    let img = {
+        let _guard = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        match render::offscreen_fullscreen_scene(
+            &[(1, image(&red, 120, 80, false))],
+            &[quad(1, 100.0, 60.0, 120.0, 80.0)],
+            W,
+            H,
+        ) {
+            Ok(rgba) => rgba,
+            Err(err) => panic!("offscreen render failed: {err}"),
+        }
+    };
+    let black = render::FULLSCREEN_BACKGROUND.map(|c| (c * 255.0).round() as u8);
+    assert_eq!(black, [0, 0, 0]);
+    for y in 0..H {
+        for x in 0..W {
+            let inside = (100..220).contains(&x) && (60..140).contains(&y);
+            let expected = if inside { [255, 0, 0] } else { black };
+            assert_rgb(
+                &img,
+                x,
+                y,
+                expected,
+                if inside { "window" } else { "no grid" },
+            );
+        }
+    }
+}

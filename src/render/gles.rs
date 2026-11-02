@@ -14,6 +14,9 @@ const GRID_FRAGMENT_SHADER: &str = include_str!("shaders/grid.frag");
 const WINDOW_VERTEX_SHADER: &str = include_str!("shaders/window.vert");
 const WINDOW_FRAGMENT_SHADER: &str = include_str!("shaders/window.frag");
 
+/// Linear RGB behind a fullscreen window: black (spec FR-014).
+pub const FULLSCREEN_BACKGROUND: [f32; 3] = [0.0, 0.0, 0.0];
+
 /// Errors from rendering.
 #[derive(Debug, thiserror::Error)]
 pub enum RenderError {
@@ -344,6 +347,20 @@ impl GlesRenderer {
         }
     }
 
+    /// Fills the currently bound framebuffer of `width` x `height` pixels with `rgb` (the
+    /// background of a fullscreen window, research W8).
+    pub fn clear(&self, rgb: [f32; 3], width: u32, height: u32) {
+        let gl = &self.gl;
+        let [r, g, b] = rgb;
+        // SAFETY: the context is current (constructor contract); clearing touches only the
+        // bound framebuffer.
+        unsafe {
+            gl.viewport(0, 0, width as i32, height as i32);
+            gl.clear_color(r, g, b, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+    }
+
     /// Draws window surfaces over what is in the framebuffer, in order (later on top).
     /// Quads without an uploaded texture are skipped.
     pub fn draw_windows(&self, quads: &[Quad], width: u32, height: u32) {
@@ -375,9 +392,10 @@ impl GlesRenderer {
     }
 
     /// Renders into a new framebuffer object and reads it back as RGBA, top row first.
+    /// `grid`: the grid to draw behind the windows; `None`: the fullscreen background.
     fn render_to_pixels(
         &self,
-        params: &GridParams,
+        grid: Option<&GridParams>,
         quads: &[Quad],
         width: u32,
         height: u32,
@@ -401,7 +419,10 @@ impl GlesRenderer {
             );
             let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
             let result = if status == glow::FRAMEBUFFER_COMPLETE {
-                self.draw(params, width, height);
+                match grid {
+                    Some(params) => self.draw(params, width, height),
+                    None => self.clear(FULLSCREEN_BACKGROUND, width, height),
+                }
                 self.draw_windows(quads, width, height);
                 gl.read_pixels(
                     0,
@@ -474,7 +495,26 @@ pub fn offscreen_scene(
     for (key, image) in images {
         renderer.upload(*key, *image)?;
     }
-    let pixels = renderer.render_to_pixels(params, quads, width, height);
+    let pixels = renderer.render_to_pixels(Some(params), quads, width, height);
+    drop(renderer);
+    pixels
+}
+
+/// Like [`offscreen_scene`], drawn the way a fullscreen window is: on the plain
+/// [`FULLSCREEN_BACKGROUND`] instead of the grid (FR-014).
+pub fn offscreen_fullscreen_scene(
+    images: &[(u64, ImageRef<'_>)],
+    quads: &[Quad],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, RenderError> {
+    let egl = Egl::software_device()?;
+    egl.make_current(None)?;
+    let mut renderer = GlesRenderer::new(egl.load_gl())?;
+    for (key, image) in images {
+        renderer.upload(*key, *image)?;
+    }
+    let pixels = renderer.render_to_pixels(None, quads, width, height);
     drop(renderer);
     pixels
 }
