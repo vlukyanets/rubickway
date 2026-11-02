@@ -36,6 +36,8 @@ pub(crate) struct SeatState {
     pointer_surface: Option<WlSurface>,
     /// Buttons held: while any is, the pointer stays on its surface (implicit grab).
     buttons_down: Vec<u32>,
+    /// The window and serial of the latest button press delivered (research W2).
+    pub last_press: Option<(WindowId, u32)>,
     /// The surface with keyboard focus (a window's root surface).
     keyboard_surface: Option<WlSurface>,
     keyboard_window: Option<WindowId>,
@@ -53,6 +55,7 @@ impl Default for SeatState {
             keyboards: Vec::new(),
             pointer_surface: None,
             buttons_down: Vec::new(),
+            last_press: None,
             keyboard_surface: None,
             keyboard_window: None,
             pressed_keys: Vec::new(),
@@ -176,7 +179,11 @@ pub(crate) fn deliver(state: &mut ServerState, inputs: &[ClientInput], time_ms: 
                 }
             }
             ClientInput::PointerLeave { .. } => pointer_leave(state),
-            ClientInput::PointerButton { code, pressed, .. } => {
+            ClientInput::PointerButton {
+                window,
+                code,
+                pressed,
+            } => {
                 let Some(surface) = state.seat.pointer_surface.clone() else {
                     continue;
                 };
@@ -186,6 +193,9 @@ pub(crate) fn deliver(state: &mut ServerState, inputs: &[ClientInput], time_ms: 
                     state.seat.buttons_down.retain(|b| b != code);
                 }
                 let serial = state.next_serial();
+                if *pressed {
+                    state.seat.last_press = Some((*window, serial));
+                }
                 let button_state = if *pressed {
                     wl_pointer::ButtonState::Pressed
                 } else {

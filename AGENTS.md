@@ -28,7 +28,7 @@ Use exactly these - don't invent equivalents.
 | Format                              | `cargo fmt` |
 | Run one test                        | `cargo test <module::test_name> -- --exact` |
 | **Quick check** - while iterating   | `cargo clippy --all-targets -- -D warnings && cargo test --lib` |
-| **Full check** - before finishing   | `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked` |
+| **Full check** - before finishing   | `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked && cargo test --release --locked` |
 
 A task isn't finished until the full check passes.
 

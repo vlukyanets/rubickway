@@ -9,6 +9,12 @@ pub enum Action {
     ResetView,
     /// Exit the compositor.
     Quit,
+    /// Focus the next window in most-recently-used order.
+    NextWindow,
+    /// Focus the previous window in most-recently-used order.
+    PreviousWindow,
+    /// Ask the focused window's application to close it.
+    CloseWindow,
 }
 
 /// One shortcut: exact modifiers plus the key's binding symbol.
@@ -38,6 +44,22 @@ pub const BINDINGS: &[Binding] = &[
         mods: MOD_SHIFT,
         sym: Keysym::q,
         action: Action::Quit,
+    },
+    Binding {
+        mods: MOD,
+        sym: Keysym::q,
+        action: Action::CloseWindow,
+    },
+    Binding {
+        mods: MOD,
+        sym: Keysym::Tab,
+        action: Action::NextWindow,
+    },
+    // The binding symbol is the level-0 symbol, so Shift+Tab still reports `Tab`.
+    Binding {
+        mods: MOD_SHIFT,
+        sym: Keysym::Tab,
+        action: Action::PreviousWindow,
     },
 ];
 

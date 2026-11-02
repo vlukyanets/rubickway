@@ -5,20 +5,54 @@
 
 use crate::canvas::{Point, Rect, Size};
 
+use super::geometry::{Edges, SizeLimits};
+
 /// A window's identity, assigned by the server when a toplevel first shows content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowId(pub u64);
+
+/// Which point of a window stays fixed when the application commits a new size (research W4).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Anchor {
+    /// The top-left corner stays (client-windows clarification 2).
+    #[default]
+    TopLeft,
+    /// The `fixed` edges keep their canvas coordinates; `right` and `bottom` are the canvas
+    /// coordinates of those edges, used when they are fixed and their opposite is dragged.
+    Edges {
+        fixed: Edges,
+        right: f64,
+        bottom: f64,
+    },
+    /// The centre stays at `point` (maximized and fullscreen windows).
+    Centre { point: Point },
+}
+
+/// A window's state (fullscreen is tracked by the shell, research W8).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Mode {
+    #[default]
+    Normal,
+    /// Maximized; `saved` is the rect to return to (`None` when maximized before it was
+    /// first shown, research W7).
+    Maximized { saved: Option<Rect> },
+}
 
 /// A window on the canvas.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Window {
     pub id: WindowId,
-    /// Canvas position of the geometry's top-left; set once on map, kept on resize.
+    /// Canvas position of the geometry's top-left; changed by moves and anchors.
     pub origin: Point,
     /// Size in canvas units.
     pub size: Size,
     /// Where the window accepts pointer input, in window coordinates.
     pub input: Vec<Rect>,
+    pub limits: SizeLimits,
+    pub anchor: Anchor,
+    pub mode: Mode,
+    /// The parent window set by the application (dialogs).
+    pub parent: Option<WindowId>,
 }
 
 impl Window {
@@ -28,32 +62,61 @@ impl Window {
     }
 }
 
-/// All windows, back to front, and keyboard focus.
+/// All windows, back to front, keyboard focus and the focus history (research W9).
 #[derive(Debug, Clone, Default)]
 pub struct Windows {
     stack: Vec<Window>,
     focus: Option<WindowId>,
+    /// Every window once, most recently focused first.
+    mru: Vec<WindowId>,
+    /// While cycling: the index in `mru` reached so far.
+    cycle: Option<usize>,
 }
 
 impl Windows {
     /// Adds a window on top, centred on `view_center`, and focuses it (FR-004, FR-008).
     pub fn map(&mut self, id: WindowId, size: Size, input: Vec<Rect>, view_center: Point) {
         self.stack.retain(|w| w.id != id);
+        self.mru.retain(|w| *w != id);
+        self.mru.insert(0, id);
+        self.cycle = None;
         let origin = view_center - size.to_vector() / 2.0;
         self.stack.push(Window {
             id,
             origin,
             size,
             input,
+            limits: SizeLimits::default(),
+            anchor: Anchor::TopLeft,
+            mode: Mode::Normal,
+            parent: None,
         });
         self.focus = Some(id);
     }
 
-    /// New size and input shape; the top-left stays (clarification 2). Returns whether the
+    /// New size and input shape; the origin follows the window's anchor. Returns whether the
     /// window exists.
     pub fn update(&mut self, id: WindowId, size: Size, input: Vec<Rect>) -> bool {
-        match self.stack.iter_mut().find(|w| w.id == id) {
+        match self.get_mut(id) {
             Some(w) => {
+                match w.anchor {
+                    Anchor::TopLeft => {}
+                    Anchor::Edges {
+                        fixed,
+                        right,
+                        bottom,
+                    } => {
+                        if fixed.right && !fixed.left {
+                            w.origin.x = right - size.w;
+                        }
+                        if fixed.bottom && !fixed.top {
+                            w.origin.y = bottom - size.h;
+                        }
+                    }
+                    Anchor::Centre { point } => {
+                        w.origin = point - size.to_vector() / 2.0;
+                    }
+                }
                 w.size = size;
                 w.input = input;
                 true
@@ -62,24 +125,144 @@ impl Windows {
         }
     }
 
+    /// Moves a window's top-left to `origin`. Returns whether the window exists.
+    pub fn move_to(&mut self, id: WindowId, origin: Point) -> bool {
+        match self.get_mut(id) {
+            Some(w) => {
+                w.origin = origin;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn set_anchor(&mut self, id: WindowId, anchor: Anchor) {
+        if let Some(w) = self.get_mut(id) {
+            w.anchor = anchor;
+        }
+    }
+
+    /// The application applied the configure that ended a resize: later size changes keep
+    /// the top-left again (US2/AC4, research W4).
+    pub fn resize_settled(&mut self, id: WindowId) {
+        if let Some(w) = self.get_mut(id)
+            && matches!(w.anchor, Anchor::Edges { .. })
+        {
+            w.anchor = Anchor::TopLeft;
+        }
+    }
+
+    pub fn set_mode(&mut self, id: WindowId, mode: Mode) {
+        if let Some(w) = self.get_mut(id) {
+            w.mode = mode;
+        }
+    }
+
+    /// Adds a window on top without focus, centred on `center`, second in the focus history
+    /// (a window opening while another is fullscreen, research W14).
+    pub fn insert_unfocused(&mut self, id: WindowId, size: Size, input: Vec<Rect>, center: Point) {
+        let focus = self.focus;
+        let mru = self.mru.clone();
+        self.map(id, size, input, center);
+        self.focus = focus.filter(|f| *f != id);
+        self.mru = mru;
+        self.mru.retain(|w| *w != id);
+        let at = self.mru.len().min(1);
+        self.mru.insert(at, id);
+    }
+
+    /// `p` (canvas) in `id`'s coordinates if `id` accepts input there.
+    pub fn hit_window(&self, id: WindowId, p: Point) -> Option<Point> {
+        let w = self.get(id)?;
+        let local = Point::new(p.x - w.origin.x, p.y - w.origin.y);
+        w.input.iter().any(|r| r.contains(local)).then_some(local)
+    }
+
+    pub fn set_limits(&mut self, id: WindowId, limits: SizeLimits) {
+        if let Some(w) = self.get_mut(id) {
+            w.limits = limits;
+        }
+    }
+
+    pub fn set_parent(&mut self, id: WindowId, parent: Option<WindowId>) {
+        if let Some(w) = self.get_mut(id) {
+            w.parent = parent;
+        }
+    }
+
+    fn get_mut(&mut self, id: WindowId) -> Option<&mut Window> {
+        self.stack.iter_mut().find(|w| w.id == id)
+    }
+
     /// Removes a window; focus moves to the topmost remaining window (FR-014). Returns whether
     /// it existed.
     pub fn unmap(&mut self, id: WindowId) -> bool {
         let before = self.stack.len();
         self.stack.retain(|w| w.id != id);
+        self.mru.retain(|w| *w != id);
+        self.cycle = None;
         if self.focus == Some(id) {
             self.focus = self.stack.last().map(|w| w.id);
+            if let Some(f) = self.focus {
+                self.mark_used(f);
+            }
         }
         self.stack.len() != before
     }
 
-    /// Moves a window to the top and focuses it (FR-009).
+    /// Moves a window to the top and focuses it (FR-009); it becomes the most recently used.
     pub fn raise_and_focus(&mut self, id: WindowId) {
-        if let Some(i) = self.stack.iter().position(|w| w.id == id) {
-            let w = self.stack.remove(i);
-            self.stack.push(w);
+        if self.raise(id) {
             self.focus = Some(id);
+            self.cycle = None;
+            self.mark_used(id);
         }
+    }
+
+    /// The focus history, most recently focused first.
+    pub fn mru(&self) -> &[WindowId] {
+        &self.mru
+    }
+
+    /// One focus-cycling step (`step` 1: next, -1: previous) from the window reached so far
+    /// (the front of the history when a cycle starts): focuses and raises that window without
+    /// reordering the history (FR-011). `None` without windows.
+    pub fn cycle(&mut self, step: i32) -> Option<WindowId> {
+        let len = i64::try_from(self.mru.len()).ok().filter(|n| *n > 0)?;
+        let from = i64::try_from(self.cycle.unwrap_or(0)).ok()?;
+        let index = usize::try_from((from + i64::from(step)).rem_euclid(len)).ok()?;
+        let id = *self.mru.get(index)?;
+        self.cycle = Some(index);
+        self.raise(id);
+        self.focus = Some(id);
+        Some(id)
+    }
+
+    /// Ends a cycle: the window reached becomes the most recently used.
+    pub fn end_cycle(&mut self) {
+        if let Some(index) = self.cycle.take()
+            && let Some(id) = self.mru.get(index).copied()
+        {
+            self.mark_used(id);
+        }
+    }
+
+    /// Moves a window to the top of the stack; returns whether it exists.
+    fn raise(&mut self, id: WindowId) -> bool {
+        match self.stack.iter().position(|w| w.id == id) {
+            Some(i) => {
+                let w = self.stack.remove(i);
+                self.stack.push(w);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Moves `id` to the front of the focus history.
+    fn mark_used(&mut self, id: WindowId) {
+        self.mru.retain(|w| *w != id);
+        self.mru.insert(0, id);
     }
 
     pub fn focus(&self) -> Option<WindowId> {
@@ -240,7 +423,253 @@ mod tests {
         assert_eq!(w.visible(view), vec![id(1), id(2), id(4)]);
     }
 
+    #[test]
+    fn new_windows_have_default_window_management_state() {
+        let mut w = Windows::default();
+        let size = Size::new(100.0, 100.0);
+        w.map(id(1), size, full(size), Point::default());
+        let win = w.get(id(1)).unwrap();
+        assert_eq!(win.anchor, Anchor::TopLeft);
+        assert_eq!(win.mode, Mode::Normal);
+        assert_eq!(win.limits, SizeLimits::default());
+        assert_eq!(win.parent, None);
+    }
+
+    #[test]
+    fn limits_and_parent_are_stored() {
+        let mut w = Windows::default();
+        let size = Size::new(100.0, 100.0);
+        w.map(id(1), size, full(size), Point::default());
+        w.map(id(2), size, full(size), Point::default());
+        let limits = SizeLimits {
+            min: Size::new(10.0, 20.0),
+            max: Size::new(0.0, 500.0),
+        };
+        w.set_limits(id(2), limits);
+        w.set_parent(id(2), Some(id(1)));
+        assert_eq!(w.get(id(2)).unwrap().limits, limits);
+        assert_eq!(w.get(id(2)).unwrap().parent, Some(id(1)));
+    }
+
+    #[test]
+    fn move_to_moves_a_window() {
+        let mut w = Windows::default();
+        let size = Size::new(100.0, 100.0);
+        w.map(id(1), size, full(size), Point::default());
+        assert!(w.move_to(id(1), Point::new(300.0, -40.0)));
+        assert_eq!(w.get(id(1)).unwrap().origin, Point::new(300.0, -40.0));
+        assert!(!w.move_to(id(9), Point::default()));
+    }
+
+    #[test]
+    fn edges_anchor_keeps_the_far_edges_when_left_and_top_are_dragged() {
+        let mut w = Windows::default();
+        let size = Size::new(100.0, 100.0);
+        w.map(id(1), size, full(size), Point::new(50.0, 50.0)); // origin (0, 0)
+        // Dragging the top-left corner: right and bottom stay fixed at 100.
+        w.set_anchor(
+            id(1),
+            Anchor::Edges {
+                fixed: Edges {
+                    top: false,
+                    bottom: true,
+                    left: false,
+                    right: true,
+                },
+                right: 100.0,
+                bottom: 100.0,
+            },
+        );
+        let bigger = Size::new(160.0, 130.0);
+        w.update(id(1), bigger, full(bigger));
+        let win = w.get(id(1)).unwrap();
+        assert_eq!(win.origin, Point::new(-60.0, -30.0));
+        assert_eq!(win.rect().end(), Point::new(100.0, 100.0));
+    }
+
+    #[test]
+    fn edges_anchor_keeps_the_origin_when_right_and_bottom_are_dragged() {
+        let mut w = Windows::default();
+        let size = Size::new(100.0, 100.0);
+        w.map(id(1), size, full(size), Point::new(50.0, 50.0));
+        w.set_anchor(
+            id(1),
+            Anchor::Edges {
+                fixed: Edges {
+                    top: true,
+                    bottom: false,
+                    left: true,
+                    right: false,
+                },
+                right: 100.0,
+                bottom: 100.0,
+            },
+        );
+        let bigger = Size::new(160.0, 130.0);
+        w.update(id(1), bigger, full(bigger));
+        assert_eq!(w.get(id(1)).unwrap().origin, Point::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn centre_anchor_keeps_the_centre() {
+        let mut w = Windows::default();
+        let size = Size::new(100.0, 100.0);
+        w.map(id(1), size, full(size), Point::default());
+        w.set_anchor(
+            id(1),
+            Anchor::Centre {
+                point: Point::new(500.0, 400.0),
+            },
+        );
+        let bigger = Size::new(300.0, 200.0);
+        w.update(id(1), bigger, full(bigger));
+        assert_eq!(w.get(id(1)).unwrap().origin, Point::new(350.0, 300.0));
+    }
+
+    /// The anchor that keeps the edges opposite to `dragged` (research W4).
+    fn opposite_anchor(dragged: Edges, rect: Rect) -> Anchor {
+        Anchor::Edges {
+            fixed: Edges {
+                top: dragged.bottom,
+                bottom: dragged.top,
+                left: dragged.right,
+                right: dragged.left,
+            },
+            right: rect.end().x,
+            bottom: rect.end().y,
+        }
+    }
+
+    #[test]
+    fn resize_settled_returns_to_top_left() {
+        let mut w = Windows::default();
+        let size = Size::new(100.0, 100.0);
+        w.map(id(1), size, full(size), Point::new(50.0, 50.0));
+        let rect = w.get(id(1)).unwrap().rect();
+        let dragged = Edges {
+            top: true,
+            bottom: false,
+            left: true,
+            right: false,
+        };
+        w.set_anchor(id(1), opposite_anchor(dragged, rect));
+        let bigger = Size::new(150.0, 150.0);
+        w.update(id(1), bigger, full(bigger));
+        let origin = w.get(id(1)).unwrap().origin;
+        assert_eq!(origin, Point::new(-50.0, -50.0));
+        w.resize_settled(id(1));
+        assert_eq!(w.get(id(1)).unwrap().anchor, Anchor::TopLeft);
+        let smaller = Size::new(80.0, 80.0);
+        w.update(id(1), smaller, full(smaller));
+        assert_eq!(w.get(id(1)).unwrap().origin, origin);
+    }
+
+    fn three() -> Windows {
+        let mut w = Windows::default();
+        let size = Size::new(100.0, 100.0);
+        for n in 1..=3 {
+            w.map(id(n), size, full(size), Point::default());
+        }
+        w
+    }
+
+    #[test]
+    fn the_focus_history_puts_the_latest_focus_first() {
+        let mut w = three();
+        assert_eq!(w.mru(), &[id(3), id(2), id(1)]);
+        w.raise_and_focus(id(1));
+        assert_eq!(w.mru(), &[id(1), id(3), id(2)]);
+        w.unmap(id(3));
+        assert_eq!(w.mru(), &[id(1), id(2)]);
+    }
+
+    #[test]
+    fn cycling_walks_the_history_without_reordering_until_it_ends() {
+        let mut w = three();
+        assert_eq!(w.cycle(1), Some(id(2)));
+        assert_eq!(w.focus(), Some(id(2)));
+        assert_eq!(w.iter().last().map(|win| win.id), Some(id(2)), "raised");
+        assert_eq!(w.mru(), &[id(3), id(2), id(1)]);
+        assert_eq!(w.cycle(1), Some(id(1)));
+        assert_eq!(w.cycle(1), Some(id(3)), "wraps around");
+        assert_eq!(w.cycle(-1), Some(id(1)));
+        w.end_cycle();
+        assert_eq!(w.mru(), &[id(1), id(3), id(2)]);
+        // A new cycle starts from the front: one step goes back to the previous window.
+        assert_eq!(w.cycle(1), Some(id(3)));
+        w.end_cycle();
+        assert_eq!(w.mru(), &[id(3), id(1), id(2)]);
+    }
+
+    #[test]
+    fn cycling_backwards_starts_at_the_oldest() {
+        let mut w = three();
+        assert_eq!(w.cycle(-1), Some(id(1)));
+        w.end_cycle();
+        assert_eq!(w.mru(), &[id(1), id(3), id(2)]);
+    }
+
+    #[test]
+    fn cycling_with_no_windows_does_nothing() {
+        let mut w = Windows::default();
+        assert_eq!(w.cycle(1), None);
+        w.end_cycle();
+        assert_eq!(w.focus(), None);
+    }
+
     proptest! {
+        #[test]
+        fn the_history_is_a_permutation_of_the_stack(
+            ops in prop::collection::vec((0u8..5, 1u64..6), 0..40),
+        ) {
+            let mut w = Windows::default();
+            let size = Size::new(10.0, 10.0);
+            for (op, n) in ops {
+                match op {
+                    0 => w.map(id(n), size, full(size), Point::default()),
+                    1 => { w.unmap(id(n)); }
+                    2 => w.raise_and_focus(id(n)),
+                    3 => { w.cycle(if n % 2 == 0 { 1 } else { -1 }); }
+                    _ => w.end_cycle(),
+                }
+                let mut stack: Vec<_> = w.iter().map(|win| win.id).collect();
+                let mut mru = w.mru().to_vec();
+                stack.sort();
+                mru.sort();
+                prop_assert_eq!(stack, mru);
+            }
+        }
+
+        #[test]
+        fn the_opposite_edges_stay_whatever_size_arrives(
+            ox in -1e5f64..1e5, oy in -1e5f64..1e5,
+            w0 in 1.0f64..4000.0, h0 in 1.0f64..4000.0,
+            edge in prop::sample::select(vec![1u32, 2, 4, 5, 6, 8, 9, 10]),
+            sizes in prop::collection::vec((1.0f64..8000.0, 1.0f64..8000.0), 1..8),
+        ) {
+            let mut w = Windows::default();
+            let size = Size::new(w0, h0);
+            w.map(id(1), size, full(size), Point::new(ox + w0 / 2.0, oy + h0 / 2.0));
+            let start = w.get(id(1)).unwrap().rect();
+            let dragged = Edges::from_resize_edge(edge).unwrap();
+            w.set_anchor(id(1), opposite_anchor(dragged, start));
+            for (sw, sh) in sizes {
+                let s = Size::new(sw, sh);
+                w.update(id(1), s, full(s));
+                let r = w.get(id(1)).unwrap().rect();
+                if !dragged.left {
+                    prop_assert!((r.origin.x - start.origin.x).abs() <= 1.0);
+                } else {
+                    prop_assert!((r.end().x - start.end().x).abs() <= 1.0);
+                }
+                if !dragged.top {
+                    prop_assert!((r.origin.y - start.origin.y).abs() <= 1.0);
+                } else {
+                    prop_assert!((r.end().y - start.end().y).abs() <= 1.0);
+                }
+            }
+        }
+
         #[test]
         fn placement_centres_any_window_anywhere(
             cx in -1e6f64..1e6, cy in -1e6f64..1e6,

@@ -9,6 +9,7 @@ mod harness;
 mod input;
 mod misbehaving;
 mod surfaces;
+mod wm;
 
 use harness::Harness;
 

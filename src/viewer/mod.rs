@@ -307,6 +307,8 @@ impl Viewer {
     fn run(&mut self, action: Action) -> Effect {
         match action {
             Action::Quit => Effect { quit: true },
+            // Window actions belong to the shell, which handles them before the viewer.
+            Action::NextWindow | Action::PreviousWindow | Action::CloseWindow => Effect::default(),
             Action::ResetView => {
                 // The camera comparison in `handle` marks the viewer dirty if this moved it.
                 self.camera.reset();

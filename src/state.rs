@@ -18,11 +18,11 @@ use wayland_server::ListeningSocket;
 
 use crate::backend::BackendEvent;
 use crate::backend::wayland_host::{Cursor, HostError, WaylandHost};
-use crate::canvas::Point;
+use crate::canvas::{Point, Size};
 use crate::render::egl::{Egl, EglError};
-use crate::render::{GlesRenderer, ImageRef, Quad, RenderError};
+use crate::render::{FULLSCREEN_BACKGROUND, GlesRenderer, ImageRef, Quad, RenderError};
 use crate::server::{Server, ServerError};
-use crate::shell::{Shell, WindowId};
+use crate::shell::{CursorShape, Edges, Shell, WindowId};
 
 /// Why the application stopped with an error. Messages follow `contracts/cli.md`.
 #[derive(Debug, Error)]
@@ -225,6 +225,8 @@ impl App {
                 let inputs = self.shell.apply(event);
                 self.server.deliver(&inputs, self.now_ms());
             }
+            // After input and window events: configures and close requests (research W1).
+            self.server.command(&self.shell.take_commands());
             self.update_cursor();
             let viewer = self.shell.viewer();
             self.server.set_viewer(viewer.buffer_size(), viewer.scale());
@@ -268,10 +270,13 @@ impl App {
                     }
                 }
                 BackendEvent::Configure { size } => {
-                    self.shell.viewer_mut().configure(size);
+                    self.shell.viewer_configured(size);
                     self.configured = true;
                 }
-                BackendEvent::Scale(scale) => self.shell.viewer_mut().set_scale(scale),
+                BackendEvent::Scale(scale) => {
+                    self.shell.viewer_mut().set_scale(scale);
+                    self.update_largest_window();
+                }
                 BackendEvent::FrameDone => {
                     self.frame_pending = false;
                     let shown = std::mem::take(&mut self.shown);
@@ -292,11 +297,23 @@ impl App {
         self.started.elapsed().as_millis() as u32
     }
 
+    /// Tells the shell the largest window it may ask for: the GPU texture limit in logical
+    /// pixels, using the scale's ceiling as applications round their buffers up (research W6).
+    fn update_largest_window(&mut self) {
+        let Some(target) = &self.target else {
+            return;
+        };
+        let scale = self.shell.viewer().scale().ceil().max(1.0);
+        let side = f64::from(target.renderer.max_texture_side()) / scale;
+        self.shell.set_largest_window(Size::new(side, side));
+    }
+
     fn update_cursor(&mut self) {
-        let wanted = if self.shell.viewer().is_panning() {
-            Cursor::Grabbing
-        } else {
-            Cursor::Default
+        let wanted = match self.shell.cursor() {
+            CursorShape::Default => Cursor::Default,
+            CursorShape::Grabbing => Cursor::Grabbing,
+            CursorShape::Move => Cursor::Move,
+            CursorShape::Resize(edges) => resize_cursor(edges),
         };
         if wanted != self.cursor {
             self.cursor = wanted;
@@ -401,6 +418,7 @@ impl App {
                 .set_max_texture_side(renderer.max_texture_side());
             self.shell.take_dirty();
             self.target = Some(Target { surface, renderer });
+            self.update_largest_window();
             // Content committed before the context existed.
             self.upload_content()?;
         }
@@ -411,14 +429,36 @@ impl App {
             return Ok(());
         };
         self.egl.make_current(Some(target.surface))?;
-        let grid = self.shell.viewer().grid_params();
-        target.renderer.draw(&grid, buffer.0, buffer.1);
+        if self.shell.fullscreen().is_some() {
+            // Only the fullscreen window, on black (FR-014); `window_quads` follows `visible`.
+            target
+                .renderer
+                .clear(FULLSCREEN_BACKGROUND, buffer.0, buffer.1);
+        } else {
+            let grid = self.shell.viewer().grid_params();
+            target.renderer.draw(&grid, buffer.0, buffer.1);
+        }
         target.renderer.draw_windows(&quads, buffer.0, buffer.1);
         self.host.request_frame();
         self.egl.swap_buffers(target.surface)?;
         self.frame_pending = true;
         self.shown = visible;
         Ok(())
+    }
+}
+
+/// The host cursor for a resize from `edges`.
+fn resize_cursor(edges: Edges) -> Cursor {
+    match (edges.top, edges.bottom, edges.left, edges.right) {
+        (true, _, true, _) => Cursor::ResizeNW,
+        (true, _, _, true) => Cursor::ResizeNE,
+        (_, true, true, _) => Cursor::ResizeSW,
+        (_, true, _, true) => Cursor::ResizeSE,
+        (true, _, _, _) => Cursor::ResizeN,
+        (_, true, _, _) => Cursor::ResizeS,
+        (_, _, true, _) => Cursor::ResizeW,
+        (_, _, _, true) => Cursor::ResizeE,
+        _ => Cursor::Default,
     }
 }
 
