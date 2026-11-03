@@ -37,7 +37,7 @@ untrusted input.
 
 - Every `tasks.md` MUST include test tasks for each user story, written and seen failing
   before the implementation tasks.
-- Automated tests MUST run headless, without a GPU, a host compositor or input devices.
+- Automated tests MUST run headless, without a GPU, another Wayland compositor or input devices.
   They cover:
   - protocol conformance through in-process clients: object lifecycles and protocol
     errors;
@@ -61,10 +61,10 @@ the hardware-only layer thin keeps the untested surface small.
 - The canvas model (geometry, viewers/cameras, placement) MUST be plain data with no
   Wayland, GL or input-device types, and MUST be fully unit-tested.
 - Backends MUST produce backend-neutral input events and render targets. Nothing above
-  the backend layer may know whether it runs nested or on DRM.
+  the backend layer may know which backend runs.
 
-Rationale: the nested backend comes first and DRM/KMS later; the core must not change
-when the backend does.
+Rationale: keeping the core independent of the hardware layer lets it be tested headless,
+and a future backend or the plugin layer needs no change to the core.
 
 ### V. Contained Unsafe
 
@@ -122,9 +122,9 @@ plugins together with the core is the only reliable way to load Rust code at run
 ## Technical Constraints
 
 - Language: Rust 1.99, edition 2024, with the toolchain pinned in the repository.
-- Delivery: a `rubickway` binary plus optional plugin libraries. The nested backend (a window
-  inside an existing Wayland session) comes first; the standalone DRM/KMS backend from a TTY
-  comes later.
+- Delivery: a `rubickway` binary plus optional plugin libraries. It runs standalone on the
+  hardware (DRM/KMS), started from a text console (TTY); there is no nested mode inside
+  another Wayland session.
 - Packaging: the core package `rubickway` and plugin packages `rubickway-features-<name>`,
   all built from the same source (on Arch: one PKGBUILD with split packages, plugins
   depending on `rubickway=$pkgver`).
@@ -154,4 +154,4 @@ plugins together with the core is the only reliable way to load Rust code at run
   still settling; 1.0.0 marks the first version the owner declares stable.
 - Reviews of specs, plans and code MUST check compliance with these principles.
 
-**Version**: 0.1.0 | **Ratified**: 2026-11-01 | **Last Amended**: 2026-11-01
+**Version**: 0.2.0 | **Ratified**: 2026-11-01 | **Last Amended**: 2026-11-02
