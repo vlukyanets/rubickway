@@ -8,6 +8,7 @@
 mod harness;
 mod input;
 mod misbehaving;
+mod outputs;
 mod surfaces;
 mod wm;
 

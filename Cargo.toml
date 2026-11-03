@@ -9,16 +9,22 @@ publish = false
 
 [dependencies]
 calloop = { version = "0.14", features = ["signals"] }
+# Standalone backend (research S1): DRM/KMS, scanout buffers, input, session, device lookup.
+# 0.14, not 0.15: gbm 0.18 is built against drm 0.14, and its buffers must be the same type.
+drm = "0.14"
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 glow = "0.18"
+input = { version = "0.10", default-features = false, features = ["udev", "libinput_1_21"] }
+kdl = { version = "6.7", default-features = false, features = ["span"] }
 khronos-egl = { version = "6", features = ["static"] }
 libc = "0.2"
+libseat = "0.2"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-wayland-backend = { version = "0.3", features = ["client_system"] }
-wayland-client = "0.31"
-wayland-egl = "0.32"
-wayland-protocols = { version = "0.32", features = ["client", "server", "staging", "unstable"] }
+udev = "0.9"
+wayland-backend = "0.3"
+wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
 # `libwayland_1_23` only unlocks the per-client buffer limit API (research R8); with the
 # pure-Rust backend it links no system library.
 wayland-server = { version = "0.31", features = ["libwayland_1_23"] }
@@ -26,6 +32,9 @@ xkbcommon = "0.9"
 
 [dev-dependencies]
 proptest = "1"
+# Test clients for the protocol tests (pure-Rust backend, no libwayland).
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "server", "staging", "unstable"] }
 
 [lints.rust]
 # Principle V: unsafe only in FFI, backend, render and plugin loader modules, which opt in with

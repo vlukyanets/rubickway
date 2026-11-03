@@ -4,7 +4,7 @@ use std::os::unix::fs::FileExt;
 
 use rubickway::canvas::{Point, Vector};
 use rubickway::input::{RawModifiers, ScrollSource};
-use rubickway::shell::ClientInput;
+use rubickway::shell::{ClientInput, WindowEvent};
 use wayland_client::Proxy;
 use wayland_client::WEnum;
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
@@ -139,7 +139,7 @@ fn focus_keys_and_modifiers_reach_the_focused_window() {
             xdg_toplevel::Event::Configure { states, .. } => Some(states.clone()),
             _ => None,
         })
-        .last();
+        .next_back();
     assert!(last.is_none_or(|s| activated(&s)));
 
     h.server.deliver(&[ClientInput::KeyboardFocus(None)], 200);
@@ -158,7 +158,7 @@ fn focus_keys_and_modifiers_reach_the_focused_window() {
             xdg_toplevel::Event::Configure { states, .. } => Some(states.clone()),
             _ => None,
         })
-        .last()
+        .next_back()
         .expect("a configure after losing focus");
     assert!(!activated(&last), "deactivated after losing focus");
 }
@@ -327,4 +327,39 @@ fn a_disconnecting_focused_client_leaves_input_free() {
             .iter()
             .any(|(oid, e)| *oid == k2.id() && matches!(e, wl_keyboard::Event::Enter { .. }))
     );
+}
+
+// --- Standalone: applications hiding the pointer (FR-008) ------------------------------------
+
+#[test]
+fn set_cursor_without_a_surface_hides_the_pointer_over_the_clients_windows() {
+    let mut h = Harness::new();
+    let c = h.connect();
+    let g = globals(h.c(c));
+    let seat: WlSeat = h.c(c).bind(8);
+    let pointer: WlPointer = seat.get_pointer(&h.c(c).qh, ());
+    let (_w, id) = open_window(&mut h, c, &g, 50, 50, RED);
+    h.server.take_window_events();
+
+    pointer.set_cursor(0, None, 0, 0);
+    h.roundtrip();
+    let events = h.server.take_window_events();
+    assert!(
+        events.contains(&WindowEvent::CursorHidden { id, hidden: true }),
+        "{events:?}"
+    );
+
+    // Asking again changes nothing; a cursor image shows the pointer again.
+    pointer.set_cursor(0, None, 0, 0);
+    h.roundtrip();
+    assert!(h.server.take_window_events().is_empty());
+    let image = g.compositor.create_surface(&h.c(c).qh, ());
+    pointer.set_cursor(0, Some(&image), 0, 0);
+    h.roundtrip();
+    assert!(
+        h.server
+            .take_window_events()
+            .contains(&WindowEvent::CursorHidden { id, hidden: false })
+    );
+    assert!(!h.c(c).is_disconnected());
 }

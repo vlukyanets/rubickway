@@ -27,7 +27,7 @@ pub enum ClientInput {
         code: u32,
         pressed: bool,
     },
-    /// Scroll values as the host delivered them.
+    /// Scroll values as the input device delivered them.
     Scroll {
         window: WindowId,
         source: ScrollSource,
@@ -99,12 +99,52 @@ pub(crate) struct Router {
     pub entered: Option<WindowId>,
     pub grab: Option<Grab>,
     pub operation: Option<Operation>,
+    /// The button that started the running pan; only its release ends it (FR-032).
+    pub pan_button: Option<u32>,
     /// Keys pressed and delivered to the focused window.
     pub held_keys: Vec<u32>,
     /// Keys whose press triggered a compositor shortcut; their release is swallowed too.
     pub consumed_keys: Vec<u32>,
-    /// Whether the host gave the viewer the keyboard.
+    /// Whether RubickWay has the keyboard (not paused on another console).
     pub viewer_focused: bool,
     /// Effective modifiers (for Mod gestures and shortcuts).
     pub mods: Modifiers,
+    /// The keyboard's modifier masks as last reported, also while no window has the keyboard:
+    /// a window getting the keyboard is told them first, so it never sees stale ones.
+    pub raw: RawModifiers,
+    /// The first press of the two-press quit, if one is pending (FR-031).
+    pub quit: QuitConfirm,
+}
+
+/// The two-press quit (FR-031, data-model "QuitConfirm").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum QuitConfirm {
+    #[default]
+    Idle,
+    /// A first press at `since` (event time, ms, wrapping).
+    Pending { since: u32 },
+}
+
+/// How long after the first press a second one still quits.
+const QUIT_WINDOW_MS: u32 = 2000;
+
+impl QuitConfirm {
+    /// A quit press at `t`: returns whether RubickWay quits now.
+    pub fn press(&mut self, t: u32) -> bool {
+        match *self {
+            QuitConfirm::Pending { since } if t.wrapping_sub(since) <= QUIT_WINDOW_MS => {
+                *self = QuitConfirm::Idle;
+                true
+            }
+            _ => {
+                *self = QuitConfirm::Pending { since: t };
+                false
+            }
+        }
+    }
+
+    /// Another key was pressed, or the keyboard went away: a pending quit is cancelled.
+    pub fn cancel(&mut self) {
+        *self = QuitConfirm::Idle;
+    }
 }

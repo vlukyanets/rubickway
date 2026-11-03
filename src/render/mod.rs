@@ -1,5 +1,6 @@
 //! Rendering: grid parameters (pure) and the EGL/GLES renderer.
 
+pub mod cursor;
 pub mod egl;
 mod gles;
 mod grid;

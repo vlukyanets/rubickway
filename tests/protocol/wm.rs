@@ -356,6 +356,29 @@ fn moves_with_other_serials_are_ignored() {
     assert!(!h.c(c).is_disconnected());
 }
 
+#[test]
+fn a_move_with_a_press_from_before_a_pause_is_ignored() {
+    // Standalone (research S22): a console switch sends the pointer leave, which releases the
+    // held buttons, so the press serial no longer counts.
+    let mut h = Harness::new();
+    let c = h.connect();
+    let g = globals(h.c(c));
+    let seat: WlSeat = h.c(c).bind(8);
+    let _pointer: WlPointer = seat.get_pointer(&h.c(c).qh, ());
+    let (w, id) = open_window(&mut h, c, &g, 64, 64, RED);
+    press(&mut h, id, true);
+    let serial = last_button_serial(&mut h, c);
+    h.server
+        .deliver(&[ClientInput::PointerLeave { window: id }], 0);
+    h.server.set_paused(true);
+    h.roundtrip();
+    h.server.set_paused(false);
+    w.toplevel._move(&seat, serial);
+    h.roundtrip();
+    assert!(move_requests(&h.server.take_window_events()).is_empty());
+    assert!(!h.c(c).is_disconnected());
+}
+
 // --- US2: interactive resize -------------------------------------------------------------------
 
 fn resize_requests(events: &[WindowEvent]) -> Vec<(WindowId, Edges)> {
@@ -518,8 +541,16 @@ fn state_requests_after_map_are_reported() {
         vec![
             WindowEvent::MaximizeRequested { id, on: true },
             WindowEvent::MaximizeRequested { id, on: false },
-            WindowEvent::FullscreenRequested { id, on: true },
-            WindowEvent::FullscreenRequested { id, on: false },
+            WindowEvent::FullscreenRequested {
+                id,
+                on: true,
+                output: None,
+            },
+            WindowEvent::FullscreenRequested {
+                id,
+                on: false,
+                output: None,
+            },
         ]
     );
 }

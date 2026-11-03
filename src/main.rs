@@ -15,11 +15,5 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    match rubickway::state::run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("rubickway: {err}");
-            ExitCode::FAILURE
-        }
-    }
+    rubickway::run_reporting_panics(rubickway::standalone::run)
 }

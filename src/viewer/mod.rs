@@ -6,17 +6,11 @@
 mod gesture;
 
 use crate::canvas::{Camera, Point, Size, Vector};
-use crate::input::bindings::{self, Action};
-use crate::input::{Button, InputEvent, Modifiers, ScrollSource};
+use crate::input::bindings::Bindings;
+use crate::input::{InputEvent, Modifiers, ScrollSource};
 use crate::render::GridParams;
 
 pub use gesture::Gesture;
-
-/// Logical size used when the host leaves the choice to us.
-pub const DEFAULT_SIZE: Size = Size {
-    w: 1280.0,
-    h: 800.0,
-};
 
 /// Zoom factor per wheel notch (10%).
 const ZOOM_STEP: f64 = 1.1;
@@ -27,26 +21,17 @@ const SCROLL_PER_STEP: f64 = 50.0;
 /// Horizontal pan per horizontal wheel notch, in logical px.
 const WHEEL_PAN: f64 = 50.0;
 
-/// What the application must do after an event. Redraws are signalled through
-/// [`Viewer::take_dirty`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Effect {
-    /// The user asked to quit.
-    pub quit: bool,
-}
-
 /// One viewer's state.
 #[derive(Debug, Clone)]
 pub struct Viewer {
     size: Size,
     scale: f64,
-    /// Largest buffer side the renderer can draw, in physical pixels.
-    max_buffer_side: u32,
     camera: Camera,
     gesture: Gesture,
     modifiers: Modifiers,
     pointer: Option<Point>,
     dirty: bool,
+    bindings: Bindings,
 }
 
 impl Default for Viewer {
@@ -59,18 +44,24 @@ impl Default for Viewer {
 const MAX_INT_SIDE: u32 = i32::MAX as u32;
 
 impl Viewer {
-    /// A viewer of the default size showing the canvas origin at 100%; it needs a first frame.
+    /// A viewer showing the canvas origin at 100%, 1 x 1 until its display's size is set with
+    /// [`Viewer::configure`]; it needs a first frame.
     pub fn new() -> Viewer {
         Viewer {
-            size: DEFAULT_SIZE,
+            size: Size::new(1.0, 1.0),
             scale: 1.0,
-            max_buffer_side: MAX_INT_SIDE,
             camera: Camera::default(),
             gesture: Gesture::Idle,
             modifiers: Modifiers::NONE,
             pointer: None,
             dirty: true,
+            bindings: Bindings::default(),
         }
+    }
+
+    /// The shortcuts and Mod this viewer reacts to.
+    pub fn set_bindings(&mut self, bindings: Bindings) {
+        self.bindings = bindings;
     }
 
     pub fn camera(&self) -> Camera {
@@ -103,41 +94,18 @@ impl Viewer {
         self.scale
     }
 
-    /// Sets the largest buffer side the renderer can draw (the GPU's framebuffer limit).
-    /// Larger windows get a uniformly smaller buffer that the host scales up.
-    pub fn set_max_buffer_side(&mut self, side: u32) {
-        let side = side.clamp(1, MAX_INT_SIDE);
-        if side != self.max_buffer_side {
-            self.max_buffer_side = side;
-            self.dirty = true;
-        }
-    }
-
-    /// The scale actually drawn at: the host's scale, reduced uniformly when the buffer would
-    /// exceed the largest side the renderer can draw.
-    pub fn render_scale(&self) -> f64 {
-        let max = f64::from(self.max_buffer_side);
-        let longest = self.size.w.max(self.size.h);
-        if longest * self.scale > max {
-            max / longest
-        } else {
-            self.scale
-        }
-    }
-
-    /// Buffer size in physical pixels: logical size times the render scale, rounded, at least
-    /// 1x1 and at most the largest drawable side.
+    /// Buffer size in physical pixels: logical size times the scale, rounded, at least 1x1 and
+    /// at most what the protocol's and EGL's `int` can hold. A display's mode is far below that.
     pub fn buffer_size(&self) -> (u32, u32) {
-        let scale = self.render_scale();
-        let max = f64::from(self.max_buffer_side);
-        // Float-to-int `as` saturates; the clamp keeps it within the drawable limit anyway.
-        let px = |v: f64| (v * scale).round().clamp(1.0, max) as u32;
+        let max = f64::from(MAX_INT_SIDE);
+        // Float-to-int `as` saturates; the clamp keeps it within `int` anyway.
+        let px = |v: f64| (v * self.scale).round().clamp(1.0, max) as u32;
         (px(self.size.w), px(self.size.h))
     }
 
-    /// Grid parameters for the current camera, size and render scale.
+    /// Grid parameters for the current camera, size and scale.
     pub fn grid_params(&self) -> GridParams {
-        GridParams::new(&self.camera, self.size, self.render_scale())
+        GridParams::new(&self.camera, self.size, self.scale)
     }
 
     /// The last pointer position in logical pixels, if the pointer is over the viewer.
@@ -155,18 +123,19 @@ impl Viewer {
         std::mem::take(&mut self.dirty)
     }
 
-    /// Applies a size from the host. Zero components fall back to the default size; the
-    /// camera centre and zoom are kept, so the canvas point at the centre stays there.
+    /// Applies the display's logical size; a non-positive or non-finite component keeps the
+    /// current one. The camera centre and zoom are kept, so the canvas point at the centre
+    /// stays there.
     pub fn configure(&mut self, size: Size) {
-        let pick = |v: f64, default: f64| if v > 0.0 && v.is_finite() { v } else { default };
-        let size = Size::new(pick(size.w, DEFAULT_SIZE.w), pick(size.h, DEFAULT_SIZE.h));
+        let pick = |v: f64, current: f64| if v > 0.0 && v.is_finite() { v } else { current };
+        let size = Size::new(pick(size.w, self.size.w), pick(size.h, self.size.h));
         if size != self.size {
             self.size = size;
             self.dirty = true;
         }
     }
 
-    /// Applies the host's preferred scale; non-finite or non-positive values are ignored.
+    /// Applies a display scale; non-finite or non-positive values are ignored.
     pub fn set_scale(&mut self, scale: f64) {
         if scale.is_finite() && scale > 0.0 && scale != self.scale {
             self.scale = scale;
@@ -174,28 +143,21 @@ impl Viewer {
         }
     }
 
-    /// Handles one input event.
-    pub fn handle(&mut self, event: &InputEvent) -> Effect {
+    /// Handles one input event; redraws are signalled through [`Viewer::take_dirty`].
+    pub fn handle(&mut self, event: &InputEvent) {
         let before = self.camera;
-        let effect = self.dispatch(event);
+        self.dispatch(event);
         if self.camera != before {
             self.dirty = true;
         }
-        effect
     }
 
-    fn dispatch(&mut self, event: &InputEvent) -> Effect {
+    fn dispatch(&mut self, event: &InputEvent) {
         match *event {
             InputEvent::Modifiers { mods, .. } => self.modifiers = mods,
-            InputEvent::Key {
-                binding_sym,
-                pressed,
-                ..
-            } => {
-                if let Some(action) = bindings::lookup(self.modifiers, binding_sym, pressed) {
-                    return self.run(action);
-                }
-            }
+            // Shortcuts and buttons are the shell's: it resets the view (to the home view,
+            // FR-020) and starts pans with `begin_pan` (FR-032).
+            InputEvent::Key { .. } | InputEvent::PointerButton { .. } => {}
             InputEvent::PointerEnter { pos } | InputEvent::PointerMotion { pos } => {
                 self.pointer = Some(pos);
                 if let Gesture::Panning { anchor } = self.gesture {
@@ -203,19 +165,13 @@ impl Viewer {
                 }
             }
             InputEvent::PointerLeave => {
-                // During a drag the host keeps the implicit grab, so a leave here means the
-                // host broke it: the drag ends.
+                // A leave during a drag means the grab broke (the console was switched away,
+                // research S23): the drag ends.
                 self.pointer = None;
                 if self.gesture.is_panning() {
                     self.gesture = Gesture::Idle;
                 }
             }
-            InputEvent::PointerButton {
-                button: Button::Left,
-                pressed,
-                ..
-            } => self.left_button(pressed),
-            InputEvent::PointerButton { .. } => {}
             InputEvent::Scroll {
                 source,
                 delta,
@@ -248,20 +204,28 @@ impl Viewer {
             }
             // Modifiers follow in their own event.
             InputEvent::FocusGained => {}
+            // The shell turns relative motion into positions for its viewers (research S9).
+            InputEvent::PointerMoved { .. } => {}
         }
-        Effect::default()
     }
 
-    /// Everything is background in this feature, so a plain left press pans, and so does
-    /// Mod + left press (which will keep panning over windows later).
-    fn left_button(&mut self, pressed: bool) {
-        match (pressed, self.gesture, self.pointer) {
-            (true, Gesture::Idle, Some(pos)) => {
+    /// Starts a pan drag at the pointer, whichever button the shell decided pans (FR-032).
+    /// Nothing without a pointer or during another gesture; returns whether a pan started.
+    pub fn begin_pan(&mut self) -> bool {
+        match (self.gesture, self.pointer) {
+            (Gesture::Idle, Some(pos)) => {
                 let anchor = self.camera.to_canvas(pos, self.size);
                 self.gesture = Gesture::Panning { anchor };
+                true
             }
-            (false, Gesture::Panning { .. }, _) => self.gesture = Gesture::Idle,
-            _ => {}
+            _ => false,
+        }
+    }
+
+    /// Ends a pan drag started with [`Viewer::begin_pan`].
+    pub fn end_pan(&mut self) {
+        if self.gesture.is_panning() {
+            self.gesture = Gesture::Idle;
         }
     }
 
@@ -286,7 +250,7 @@ impl Viewer {
                 }
             }
             ScrollSource::Finger | ScrollSource::Continuous => {
-                if bindings::mod_held(self.modifiers) {
+                if self.bindings.mod_held(self.modifiers) {
                     let steps = -delta.y / SCROLL_PER_STEP;
                     if steps != 0.0 {
                         self.camera.zoom_at(ZOOM_STEP.powf(steps), p, self.size);
@@ -302,18 +266,5 @@ impl Viewer {
     /// The point zoom is centred on: the pointer, or the viewer centre without one.
     fn focus_point(&self) -> Point {
         self.pointer.unwrap_or_else(|| self.size.center())
-    }
-
-    fn run(&mut self, action: Action) -> Effect {
-        match action {
-            Action::Quit => Effect { quit: true },
-            // Window actions belong to the shell, which handles them before the viewer.
-            Action::NextWindow | Action::PreviousWindow | Action::CloseWindow => Effect::default(),
-            Action::ResetView => {
-                // The camera comparison in `handle` marks the viewer dirty if this moved it.
-                self.camera.reset();
-                Effect::default()
-            }
-        }
     }
 }

@@ -16,10 +16,11 @@ jobs:
       # Installs the toolchain and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       # System libraries: Wayland and xkbcommon to link, EGL/GLES + Mesa (llvmpipe) for the
-      # rendering tests, xkb-data for the keymap tests.
+      # rendering tests, xkb-data for the keymap tests; libinput, libseat, libgbm and libudev
+      # for the standalone backend.
       - run: |
           sudo apt-get update
-          sudo apt-get install -y libwayland-dev libxkbcommon-dev libegl-dev libgles-dev libegl-mesa0 xkb-data
+          sudo apt-get install -y libxkbcommon-dev libegl-dev libgles-dev libegl-mesa0 xkb-data libinput-dev libseat-dev libgbm-dev libudev-dev
       - run: cargo fetch --locked
       - run: cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked

@@ -24,13 +24,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 use wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
-use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::{Display, DisplayHandle, ListeningSocket};
 
 use crate::canvas::{Point, Rect};
 use crate::shell::{ClientInput, WindowCommand, WindowEvent, WindowId};
 
 pub use compositor::Transform;
+pub use output::OutputDesc;
 
 use compositor::{Region, Surface};
 use shm::{Pool, ShmBuffer};
@@ -52,6 +52,15 @@ pub enum ServerError {
 /// Identifies a surface's content for the renderer (its texture).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SurfaceKey(pub u64);
+
+/// What changed on screen (`Server::take_damage`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Damage {
+    /// Windows or subsurfaces came or went: redraw everything.
+    pub all: bool,
+    /// Windows whose content changed, in id order.
+    pub windows: Vec<WindowId>,
+}
 
 /// One surface of a window, ready to draw.
 #[derive(Debug, Clone, PartialEq)]
@@ -79,6 +88,19 @@ pub struct ShmImage<'a> {
     pub opaque: bool,
 }
 
+/// ` (pid 1234, kitty)` for the connect log line: the peer's pid from the socket and its
+/// command name from `/proc/<pid>/comm` (an in-memory procfs file, read at once). For the log
+/// only: both can be spoofed.
+fn describe_process(client: &wayland_server::Client, dh: &DisplayHandle) -> String {
+    let Ok(creds) = client.get_credentials(dh) else {
+        return String::new();
+    };
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", creds.pid))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "?".into());
+    format!(" (pid {}, {comm})", creds.pid)
+}
+
 /// Per-connection data: a number for the logs.
 #[derive(Debug)]
 pub struct ClientState {
@@ -86,9 +108,8 @@ pub struct ClientState {
 }
 
 impl ClientData for ClientState {
-    fn initialized(&self, _client_id: ClientId) {
-        tracing::info!("application {} connected", self.id);
-    }
+    // The connect line is logged by `Server::insert_client`, which knows the process.
+    fn initialized(&self, _client_id: ClientId) {}
 
     fn disconnected(&self, _client_id: ClientId, reason: DisconnectReason) {
         match reason {
@@ -122,15 +143,20 @@ pub struct ServerState {
     pub(crate) pools: HashMap<ObjectId, Pool>,
     pub(crate) buffers: HashMap<ObjectId, ShmBuffer>,
     pub(crate) xdg_surfaces: HashMap<ObjectId, XdgSurfaceData>,
-    pub(crate) outputs: Vec<WlOutput>,
+    pub(crate) outputs: Vec<output::OutputEntry>,
     pub(crate) seat: seat::SeatState,
     /// Mapped windows and their root surface.
     pub(crate) windows: HashMap<WindowId, ObjectId>,
+    /// The displays each window was last told it is on (`wl_surface.enter`).
+    pub(crate) window_outputs: HashMap<WindowId, Vec<u32>>,
     pub(crate) window_events: Vec<WindowEvent>,
-    /// Viewer buffer size in physical pixels and scale.
-    pub(crate) viewer: ((u32, u32), f64),
     pub(crate) max_texture_side: u32,
+    /// A window or subsurface came or went: every display needs a new frame.
     pub(crate) dirty: bool,
+    /// Surfaces with new content since the last `take_damage`.
+    pub(crate) damaged: Vec<ObjectId>,
+    /// RubickWay is on another console: nothing is shown, frame callbacks wait (S12).
+    paused: bool,
     /// Keys of destroyed surfaces whose textures can be freed.
     pub(crate) destroyed: Vec<SurfaceKey>,
     next_window: u64,
@@ -154,12 +180,10 @@ impl ServerState {
         WindowId(self.next_window)
     }
 
-    /// The viewer scale applications should draw at, as an integer (ceil) and in 120ths.
+    /// The scale applications should draw at, as an integer and in 120ths: 1 on every display
+    /// (contracts/protocols.md); a per-display scale is a later feature.
     pub(crate) fn scales(&self) -> (i32, u32) {
-        let scale = self.viewer.1;
-        let integer = scale.ceil().clamp(1.0, 64.0) as i32;
-        let fractional = (scale * 120.0).round().clamp(120.0, 64.0 * 120.0) as u32;
-        (integer, fractional)
+        (1, 120)
     }
 }
 
@@ -182,7 +206,6 @@ impl Server {
         shm::create_global(&dh);
         xdg_shell::create_global(&dh);
         seat::create_global(&dh);
-        output::create_global(&dh);
         data_device::create_global(&dh);
         viewporter::create_globals(&dh);
         Ok(Server {
@@ -197,10 +220,12 @@ impl Server {
                 outputs: Vec::new(),
                 seat: seat::SeatState::default(),
                 windows: HashMap::new(),
+                window_outputs: HashMap::new(),
                 window_events: Vec::new(),
-                viewer: ((1280, 800), 1.0),
                 max_texture_side: i32::MAX as u32,
                 dirty: false,
+                damaged: Vec::new(),
+                paused: false,
                 destroyed: Vec::new(),
                 next_window: 0,
                 next_surface: 0,
@@ -227,6 +252,10 @@ impl Server {
             .state
             .dh
             .insert_client(stream, Arc::new(ClientState { id }))?;
+        tracing::info!(
+            "application {id} connected{}",
+            describe_process(&client, &self.state.dh)
+        );
         Ok(client.id())
     }
 
@@ -258,9 +287,22 @@ impl Server {
         std::mem::take(&mut self.state.window_events)
     }
 
-    /// Whether anything visible changed since the last call.
-    pub fn take_dirty(&mut self) -> bool {
-        std::mem::take(&mut self.state.dirty)
+    /// What changed on screen since the last call: everything (a window or subsurface came or
+    /// went), or the content of these windows only.
+    pub fn take_damage(&mut self) -> Damage {
+        let surfaces = std::mem::take(&mut self.state.damaged);
+        let mut windows: Vec<WindowId> = Vec::new();
+        for (window, root) in &self.state.windows {
+            let tree = compositor::tree(&self.state, root);
+            if surfaces.iter().any(|s| tree.contains(s)) {
+                windows.push(*window);
+            }
+        }
+        windows.sort_unstable();
+        Damage {
+            all: std::mem::take(&mut self.state.dirty),
+            windows,
+        }
     }
 
     /// The surfaces of a window in drawing order (back to front), in window coordinates. Empty
@@ -293,8 +335,12 @@ impl Server {
         compositor::take_destroyed(&mut self.state)
     }
 
-    /// The host presented a frame that showed `windows`: complete their frame callbacks.
+    /// A frame that showed `windows` reached the screen: complete their frame callbacks. Does
+    /// nothing while paused (nothing is shown then).
     pub fn presented(&mut self, time_ms: u32, windows: &[WindowId]) {
+        if self.state.paused {
+            return;
+        }
         for id in windows {
             if let Some(root) = self.state.windows.get(id).cloned() {
                 compositor::complete_callbacks(&mut self.state, &root, time_ms);
@@ -302,8 +348,18 @@ impl Server {
         }
     }
 
-    /// Whether any surface of `windows` waits for a frame callback.
+    /// Pauses or resumes showing windows (console switched away and back, research S12):
+    /// while paused, frame callbacks wait; content and window changes are still accepted, and
+    /// only the latest content of each surface is kept.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.state.paused = paused;
+    }
+
+    /// Whether any surface of `windows` waits for a frame callback (never while paused).
     pub fn has_pending_callbacks(&self, windows: &[WindowId]) -> bool {
+        if self.state.paused {
+            return false;
+        }
         windows.iter().any(|id| {
             self.state
                 .windows
@@ -323,12 +379,12 @@ impl Server {
         seat::deliver(&mut self.state, inputs, time_ms);
     }
 
-    /// The host keymap (xkb text), shared with every application's keyboard.
+    /// The configured keymap (xkb text), shared with every application's keyboard.
     pub fn set_keymap(&mut self, text: &str) {
         seat::set_keymap(&mut self.state, text);
     }
 
-    /// The host's key repeat rate (keys per second) and delay (ms).
+    /// The key repeat rate (keys per second) and delay (ms) applications use.
     pub fn set_repeat(&mut self, rate: i32, delay: i32) {
         seat::set_repeat(&mut self.state, rate, delay);
     }
@@ -339,16 +395,25 @@ impl Server {
         self.state.max_texture_side = side.max(1);
     }
 
-    /// The viewer's buffer size (physical pixels) and scale, announced to applications.
-    pub fn set_viewer(&mut self, buffer: (u32, u32), scale: f64) {
-        if !scale.is_finite() || scale <= 0.0 || self.state.viewer == (buffer, scale) {
+    /// Adds (or re-describes) the output of display `id` at its position in the row (FR-015).
+    pub fn add_output(&mut self, id: u32, desc: OutputDesc) {
+        output::add(&mut self.state, id, desc);
+    }
+
+    /// Removes the output of display `id`; windows on it get a `leave`, and clients' objects
+    /// stay valid and inert.
+    pub fn remove_output(&mut self, id: u32) {
+        output::remove(&mut self.state, id);
+    }
+
+    /// The displays showing `window` now: its surface gets `enter` for each new one and
+    /// `leave` for each one it is no longer on (FR-018, contracts/protocols.md).
+    pub fn set_window_outputs(&mut self, window: WindowId, ids: &[u32]) {
+        // Windows keep the outputs they were on while paused; the next call after the resume
+        // sends the difference (FR-015).
+        if self.state.paused {
             return;
         }
-        let old_scales = self.state.scales();
-        self.state.viewer = (buffer, scale);
-        output::announce_all(&self.state);
-        if self.state.scales() != old_scales {
-            compositor::announce_scale_all(&self.state);
-        }
+        output::set_window_outputs(&mut self.state, window, ids);
     }
 }
