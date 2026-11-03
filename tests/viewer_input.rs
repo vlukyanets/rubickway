@@ -1,7 +1,7 @@
 //! Viewer behaviour driven by backend-neutral input events.
 
 use rubickway::canvas::{Camera, Size};
-use rubickway::input::{InputEvent, Keysym, Modifiers, RawModifiers};
+use rubickway::input::{InputEvent, Modifiers, RawModifiers};
 use rubickway::viewer::Viewer;
 
 fn modifiers(mods: Modifiers) -> InputEvent {
@@ -9,22 +9,6 @@ fn modifiers(mods: Modifiers) -> InputEvent {
         mods,
         raw: RawModifiers::default(),
     }
-}
-
-fn alt_shift() -> Modifiers {
-    Modifiers {
-        alt: true,
-        shift: true,
-        ..Modifiers::NONE
-    }
-}
-
-fn press(viewer: &mut Viewer, sym: Keysym) -> rubickway::viewer::Effect {
-    viewer.handle(&InputEvent::Key {
-        keycode: 0,
-        binding_sym: sym,
-        pressed: true,
-    })
 }
 
 // --- User Story 1: viewer basics -------------------------------------------------------------
@@ -46,15 +30,6 @@ fn resize_keeps_centre_and_zoom() {
     assert_eq!(viewer.camera(), before);
     assert_eq!(viewer.size(), Size::new(800.0, 600.0));
     assert!(viewer.take_dirty());
-}
-
-#[test]
-fn zero_configure_sizes_fall_back_to_the_default() {
-    let mut viewer = Viewer::new();
-    viewer.configure(Size::new(0.0, 0.0));
-    assert_eq!(viewer.size(), Size::new(1280.0, 800.0));
-    viewer.configure(Size::new(500.0, 0.0));
-    assert_eq!(viewer.size(), Size::new(500.0, 800.0));
 }
 
 #[test]
@@ -96,68 +71,10 @@ fn huge_sizes_do_not_overflow_and_keep_the_logical_size() {
     );
 }
 
-#[test]
-fn buffer_is_scaled_down_uniformly_to_the_gpu_maximum() {
-    let mut viewer = Viewer::new();
-    viewer.set_max_buffer_side(16384);
-    viewer.configure(Size::new(100_000.0, 50_000.0));
-    viewer.set_scale(1.25);
-    // One effective scale for both axes keeps the aspect ratio and the grid correct.
-    assert_eq!(viewer.buffer_size(), (16384, 8192));
-    assert!((viewer.render_scale() - 0.16384).abs() < 1e-12);
-    // Below the limit nothing changes.
-    viewer.configure(Size::new(1280.0, 800.0));
-    assert_eq!(viewer.buffer_size(), (1600, 1000));
-    assert_eq!(viewer.render_scale(), 1.25);
-}
-
-#[test]
-fn mod_shift_q_quits() {
-    let mut viewer = Viewer::new();
-    viewer.handle(&modifiers(alt_shift()));
-    assert!(press(&mut viewer, Keysym::q).quit);
-}
-
-#[test]
-fn quit_triggers_on_press_only() {
-    let mut viewer = Viewer::new();
-    viewer.handle(&modifiers(alt_shift()));
-    let release = viewer.handle(&InputEvent::Key {
-        keycode: 0,
-        binding_sym: Keysym::q,
-        pressed: false,
-    });
-    assert!(!release.quit);
-    // A second press asks to quit again; quitting only once is the application's job.
-    assert!(press(&mut viewer, Keysym::q).quit);
-    assert!(press(&mut viewer, Keysym::q).quit);
-}
-
-#[test]
-fn q_without_the_exact_modifiers_does_nothing() {
-    let mut viewer = Viewer::new();
-    for mods in [
-        Modifiers::NONE,
-        Modifiers {
-            alt: true,
-            ..Modifiers::NONE
-        },
-        Modifiers {
-            alt: true,
-            shift: true,
-            ctrl: true,
-            ..Modifiers::NONE
-        },
-    ] {
-        viewer.handle(&modifiers(mods));
-        assert!(!press(&mut viewer, Keysym::q).quit, "{mods:?}");
-    }
-}
-
 // --- User Story 2: pan and zoom --------------------------------------------------------------
 
 use rubickway::canvas::{Point, Vector};
-use rubickway::input::{Button, ScrollSource};
+use rubickway::input::ScrollSource;
 
 fn close(a: Point, b: Point) -> bool {
     (a.x - b.x).abs() < 1e-6 && (a.y - b.y).abs() < 1e-6
@@ -170,12 +87,13 @@ fn ready_viewer(pointer: Point) -> Viewer {
     viewer
 }
 
+/// The pan button pressed or released, as the shell drives the viewer (FR-032).
 fn button(viewer: &mut Viewer, pressed: bool) {
-    viewer.handle(&InputEvent::PointerButton {
-        button: Button::Left,
-        code: 0x110,
-        pressed,
-    });
+    if pressed {
+        viewer.begin_pan();
+    } else {
+        viewer.end_pan();
+    }
 }
 
 fn motion(viewer: &mut Viewer, pos: Point) {
@@ -198,9 +116,10 @@ fn finger(viewer: &mut Viewer, source: ScrollSource, delta: Vector) {
     });
 }
 
-fn alt() -> Modifiers {
+/// Mod (Super by default) held.
+fn super_mod() -> Modifiers {
     Modifiers {
-        alt: true,
+        logo: true,
         ..Modifiers::NONE
     }
 }
@@ -230,7 +149,7 @@ fn drag_keeps_the_grabbed_point_under_the_pointer() {
 fn mod_drag_pans_too() {
     let start = Point::new(400.0, 300.0);
     let mut viewer = ready_viewer(start);
-    viewer.handle(&modifiers(alt()));
+    viewer.handle(&modifiers(super_mod()));
     let anchor = viewer.camera().to_canvas(start, viewer.size());
     button(&mut viewer, true);
     motion(&mut viewer, Point::new(420.0, 330.0));
@@ -302,7 +221,7 @@ fn mod_scroll_zooms_one_step_per_50_px() {
     for source in [ScrollSource::Finger, ScrollSource::Continuous] {
         let p = Point::new(300.0, 300.0);
         let mut viewer = ready_viewer(p);
-        viewer.handle(&modifiers(alt()));
+        viewer.handle(&modifiers(super_mod()));
         let under = viewer.camera().to_canvas(p, viewer.size());
         finger(&mut viewer, source, Vector::new(0.0, -50.0));
         assert!((viewer.camera().zoom - 1.1).abs() < 1e-12, "{source:?}");
@@ -359,29 +278,5 @@ fn zooming_at_a_limit_needs_no_frame() {
     assert_eq!(viewer.camera().zoom, 10.0);
     viewer.take_dirty();
     wheel(&mut viewer, -120.0);
-    assert!(!viewer.take_dirty());
-}
-
-// --- User Story 3: return home ---------------------------------------------------------------
-
-#[test]
-fn mod_0_restores_the_startup_view() {
-    let p = Point::new(100.0, 100.0);
-    let mut viewer = ready_viewer(p);
-    button(&mut viewer, true);
-    motion(&mut viewer, Point::new(900.0, 700.0));
-    button(&mut viewer, false);
-    wheel(&mut viewer, -360.0);
-    assert_ne!(viewer.camera(), Camera::default());
-    viewer.take_dirty();
-
-    viewer.handle(&modifiers(alt()));
-    press(&mut viewer, Keysym::_0);
-    assert_eq!(viewer.camera(), Camera::default());
-    assert!(viewer.take_dirty());
-
-    // A second press (or key repeat) changes nothing more.
-    press(&mut viewer, Keysym::_0);
-    assert_eq!(viewer.camera(), Camera::default());
     assert!(!viewer.take_dirty());
 }

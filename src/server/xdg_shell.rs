@@ -457,7 +457,7 @@ fn map(state: &mut ServerState, xdg_id: &ObjectId, root: &ObjectId) {
         limits,
         parent,
     });
-    output::enter(state, root);
+    // The displays showing it are told by `Server::set_window_outputs`.
     compositor::announce_scale(state, root);
     state.dirty = true;
 }
@@ -485,6 +485,7 @@ fn unmap(state: &mut ServerState, xdg_id: &ObjectId) {
     let parent = x.parent.take();
     tracing::info!("window {} closed", id.0);
     state.windows.remove(&id);
+    state.window_outputs.remove(&id);
     // Its children get its own parent (xdg_toplevel.set_parent).
     for child in state.xdg_surfaces.values_mut() {
         if child.parent.as_ref() == Some(xdg_id) {
@@ -781,15 +782,20 @@ impl Dispatch<XdgToplevel, ObjectId> for ServerState {
                         .push(WindowEvent::MaximizeRequested { id, on });
                 }
             }
-            // The output is ignored: there is one viewer.
+            // A named output is passed on as its display's viewer; a removed one names none
+            // (FR-022).
             xdg_toplevel::Request::SetFullscreen { .. }
             | xdg_toplevel::Request::UnsetFullscreen => {
-                let on = matches!(request, xdg_toplevel::Request::SetFullscreen { .. });
+                let (on, output) = match &request {
+                    xdg_toplevel::Request::SetFullscreen { output } => (true, output.clone()),
+                    _ => (false, None),
+                };
                 x.wants_fullscreen = on;
                 if let Some(id) = x.window {
+                    let output = output.and_then(|o| output::viewer_of(state, &o));
                     state
                         .window_events
-                        .push(WindowEvent::FullscreenRequested { id, on });
+                        .push(WindowEvent::FullscreenRequested { id, on, output });
                 }
             }
             xdg_toplevel::Request::SetParent { parent } => {

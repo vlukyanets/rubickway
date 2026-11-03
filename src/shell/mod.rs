@@ -4,10 +4,10 @@
 //! The server reports windows and applications' requests as [`WindowEvent`]s, which the
 //! application applies here; the shell never calls the server (client-windows research R7) and
 //! answers with [`WindowCommand`]s instead (window-management research W1). Input is routed per
-//! contracts/input.md: Mod gestures, pinch and the background go to the viewer (canvas
-//! navigation), Mod + Shift + left and Mod + right on a window move and resize it, Mod+Tab
-//! cycles focus, everything else goes to the window under the pointer or with keyboard focus,
-//! as [`ClientInput`]s. Maximize and fullscreen are decided here too (research W7, W8).
+//! contracts/input.md: Mod + scroll, pinch and the background go to the viewer (canvas
+//! navigation), the pointer bindings pan, move and resize (by default Mod + left moves and
+//! Mod + right resizes a window, Mod+Shift + left pans), Mod+Tab cycles focus, everything else
+//! goes to the window under the pointer or with keyboard focus, as [`ClientInput`]s. Maximize and fullscreen are decided here too (research W7, W8).
 
 mod geometry;
 mod route;
@@ -19,10 +19,20 @@ pub use windows::*;
 
 use route::{Grab, Op, Operation, Router};
 
-use crate::canvas::{Camera, Point, Rect, Size, Vector};
-use crate::input::bindings::{self, Action};
+use crate::canvas::{Camera, Layout, LayoutEntry, Point, Rect, Size, Vector, ViewerId};
+use crate::input::bindings::{Action, Bindings, PointerAction};
 use crate::input::{Button, InputEvent, Keysym, ScrollSource};
-use crate::viewer::{Effect, Viewer};
+use crate::viewer::Viewer;
+
+/// What the application must do after an input event. Redraws are signalled through
+/// [`Shell::take_dirty_viewers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Effect {
+    /// The user asked to quit.
+    pub quit: bool,
+    /// The user pressed spawn binding `n`: run its command (FR-014).
+    pub spawn: Option<usize>,
+}
 
 /// A change to the windows, or a request from an application, reported by the server.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,8 +72,16 @@ pub enum WindowEvent {
     ResizeRequested { id: WindowId, edges: Edges },
     /// The application asked to be maximized (`on`) or restored.
     MaximizeRequested { id: WindowId, on: bool },
-    /// The application asked to go fullscreen (`on`) or leave it.
-    FullscreenRequested { id: WindowId, on: bool },
+    /// The application asked to go fullscreen (`on`) or leave it; `output`: the viewer of the
+    /// output it named, if that output still is a display (FR-022).
+    FullscreenRequested {
+        id: WindowId,
+        on: bool,
+        output: Option<ViewerId>,
+    },
+    /// The application hid the pointer over its windows (`wl_pointer.set_cursor` without a
+    /// surface) or showed it again (FR-008).
+    CursorHidden { id: WindowId, hidden: bool },
 }
 
 /// States the shell asks a window to have (`activated` follows keyboard focus).
@@ -97,12 +115,37 @@ pub enum CursorShape {
     Move,
     /// An interactive resize from these edges.
     Resize(Edges),
+    /// No pointer: the application under it hid it, and no gesture runs (FR-008).
+    Hidden,
 }
 
-/// The viewer, the windows it shows, and input routing.
+/// One display's viewer (research S14); its home view is the layout's.
+#[derive(Debug, Clone)]
+struct ViewerSlot {
+    id: ViewerId,
+    viewer: Viewer,
+    /// Its fullscreen window, if any (research W8; one per viewer, FR-022).
+    fullscreen: Option<Fullscreen>,
+}
+
+/// The viewers, the windows they show, and input routing.
 #[derive(Debug, Clone)]
 pub struct Shell {
-    viewer: Viewer,
+    /// The shortcuts and Mod (research S15); every viewer has a copy.
+    bindings: Bindings,
+    /// One per display, in the order they were added.
+    viewers: Vec<ViewerSlot>,
+    /// The viewer used while no display exists; it shows nothing, and maximize and fullscreen
+    /// are not granted (spec Edge Cases "No display at all").
+    spare: Viewer,
+    /// The row of displays and the pointer position (research S9).
+    layout: Layout,
+    /// The viewer under the pointer (FR-019).
+    active: Option<ViewerId>,
+    /// The viewer a pan started on, until the pan ends (FR-019).
+    pan_viewer: Option<ViewerId>,
+    /// Counts connections, for the row order of external displays (FR-018).
+    next_seq: u64,
     windows: Windows,
     router: Router,
     commands: Vec<WindowCommand>,
@@ -111,11 +154,24 @@ pub struct Shell {
     settling: Vec<WindowId>,
     /// The largest window size that can be displayed (research W6).
     largest: Size,
-    /// The fullscreen window, if any (research W8).
-    fullscreen: Option<Fullscreen>,
+    /// The viewer each maximized window was maximized for (FR-022).
+    maximized_on: Vec<(WindowId, ViewerId)>,
     /// Initial states answered at `Created`, entered at `Mapped` (research W13).
     initial: Vec<Initial>,
+    /// Windows whose application hid the pointer (FR-008).
+    cursor_hidden: Vec<WindowId>,
     dirty: bool,
+}
+
+/// The canvas rectangle a viewer shows.
+fn view_rect_of(viewer: &Viewer) -> Rect {
+    let size = viewer.size();
+    let camera = viewer.camera();
+    let top_left = camera.to_canvas(Point::new(0.0, 0.0), size);
+    Rect::new(
+        top_left,
+        Size::new(size.w / camera.zoom, size.h / camera.zoom),
+    )
 }
 
 /// A fullscreen window and what to restore when it leaves fullscreen.
@@ -144,9 +200,24 @@ impl Default for Shell {
 }
 
 impl Shell {
+    /// A shell with the default shortcuts (Mod = Super, no spawns); see
+    /// [`Shell::with_bindings`].
     pub fn new() -> Shell {
+        Shell::with_bindings(Bindings::default())
+    }
+
+    /// A shell whose shortcuts and Mod come from `bindings` (FR-005, FR-014).
+    pub fn with_bindings(bindings: Bindings) -> Shell {
+        let mut spare = Viewer::new();
+        spare.set_bindings(bindings.clone());
         Shell {
-            viewer: Viewer::new(),
+            bindings,
+            viewers: Vec::new(),
+            spare,
+            layout: Layout::default(),
+            active: None,
+            pan_viewer: None,
+            next_seq: 0,
             windows: Windows::default(),
             router: Router::default(),
             commands: Vec::new(),
@@ -155,15 +226,87 @@ impl Shell {
                 w: f64::INFINITY,
                 h: f64::INFINITY,
             },
-            fullscreen: None,
+            maximized_on: Vec::new(),
             initial: Vec::new(),
+            cursor_hidden: Vec::new(),
             dirty: true,
         }
     }
 
-    /// The fullscreen window, if any.
+    /// The active viewer's fullscreen window, if any.
     pub fn fullscreen(&self) -> Option<WindowId> {
-        self.fullscreen.map(|f| f.window)
+        self.active_fs().map(|f| f.window)
+    }
+
+    /// Viewer `id`'s fullscreen window, if any (FR-022).
+    pub fn fullscreen_in(&self, id: ViewerId) -> Option<WindowId> {
+        self.slot(id).and_then(|s| s.fullscreen).map(|f| f.window)
+    }
+
+    fn slot(&self, id: ViewerId) -> Option<&ViewerSlot> {
+        self.viewers.iter().find(|s| s.id == id)
+    }
+
+    fn slot_mut(&mut self, id: ViewerId) -> Option<&mut ViewerSlot> {
+        self.viewers.iter_mut().find(|s| s.id == id)
+    }
+
+    fn active_fs(&self) -> Option<Fullscreen> {
+        self.active
+            .and_then(|id| self.slot(id))
+            .and_then(|s| s.fullscreen)
+    }
+
+    /// The viewer where `window` is fullscreen, and that fullscreen state.
+    fn fs_of(&self, window: WindowId) -> Option<(ViewerId, Fullscreen)> {
+        self.viewers.iter().find_map(|s| {
+            s.fullscreen
+                .filter(|f| f.window == window)
+                .map(|f| (s.id, f))
+        })
+    }
+
+    fn set_camera_of(&mut self, id: ViewerId, camera: Camera) {
+        if let Some(slot) = self.slot_mut(id) {
+            slot.viewer.set_camera(camera);
+        }
+    }
+
+    /// The viewer maximize and fullscreen use for `window` (FR-022): the active viewer if it
+    /// shows part of the window, else the one showing the largest part, else the active one;
+    /// `None` without displays.
+    fn window_viewer(&self, window: WindowId) -> Option<ViewerId> {
+        let rect = self.windows.get(window)?.rect();
+        let active = self.active?;
+        let area = |id: ViewerId| {
+            self.slot(id)
+                .and_then(|s| view_rect_of(&s.viewer).intersection(&rect))
+                .map_or(0.0, |r| r.size.w * r.size.h)
+        };
+        if area(active) > 0.0 {
+            return Some(active);
+        }
+        let best = self
+            .viewers
+            .iter()
+            .map(|s| (s.id, area(s.id)))
+            .filter(|(_, a)| *a > 0.0)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id);
+        Some(best.unwrap_or(active))
+    }
+
+    /// The viewer whose size a maximized or fullscreen `window` gets.
+    fn sizing_viewer(&self, window: WindowId) -> Option<ViewerId> {
+        self.fs_of(window)
+            .map(|(id, _)| id)
+            .or_else(|| {
+                self.maximized_on
+                    .iter()
+                    .find(|(w, v)| *w == window && self.slot(*v).is_some())
+                    .map(|(_, v)| *v)
+            })
+            .or_else(|| self.window_viewer(window))
     }
 
     /// Commands for the server queued since the last call.
@@ -182,31 +325,40 @@ impl Shell {
                 op: Op::Resize { edges, .. },
                 ..
             }) => CursorShape::Resize(*edges),
-            None if self.viewer.is_panning() => CursorShape::Grabbing,
+            None if self.av().is_panning() => CursorShape::Grabbing,
+            None if self
+                .router
+                .entered
+                .is_some_and(|w| self.cursor_hidden.contains(&w)) =>
+            {
+                CursorShape::Hidden
+            }
             None => CursorShape::Default,
         }
     }
 
-    /// The viewer window got a new logical size: maximized and fullscreen windows follow it.
-    pub fn viewer_configured(&mut self, size: Size) {
-        let before = self.viewer.size();
-        self.viewer.configure(size);
-        if self.viewer.size() == before {
-            return;
-        }
-        let maximized: Vec<WindowId> = self
+    /// Viewer `id` got a new size: its maximized and fullscreen windows follow it, and so do
+    /// initial states granted for the active viewer.
+    fn viewer_resized(&mut self, id: ViewerId) {
+        let follow: Vec<WindowId> = self
             .windows
             .iter()
-            .filter(|w| matches!(w.mode, Mode::Maximized { .. }) || self.is_fullscreen(w.id))
+            .filter(|w| {
+                (matches!(w.mode, Mode::Maximized { .. }) || self.is_fullscreen(w.id))
+                    && self.sizing_viewer(w.id) == Some(id)
+            })
             .map(|w| w.id)
             .collect();
-        for id in maximized {
-            self.configure_viewer_size(id);
+        for window in follow {
+            self.configure_viewer_size(window);
+        }
+        if self.active != Some(id) {
+            return;
         }
         for init in self.initial.clone() {
             self.commands.push(WindowCommand::Configure {
                 window: init.window,
-                size: Some(init.limits.clamp(self.viewer.size(), self.largest)),
+                size: Some(init.limits.clamp(self.av().size(), self.largest)),
                 states: States {
                     maximized: init.maximized,
                     fullscreen: init.fullscreen,
@@ -217,12 +369,16 @@ impl Shell {
     }
 
     fn is_fullscreen(&self, id: WindowId) -> bool {
-        self.fullscreen.is_some_and(|f| f.window == id)
+        self.fs_of(id).is_some()
     }
 
-    /// Asks a maximized or fullscreen window for the viewer size.
+    /// Asks a maximized or fullscreen window for its viewer's size.
     fn configure_viewer_size(&mut self, id: WindowId) {
-        let size = self.clamp_size(id, self.viewer.size());
+        let viewer_size = self
+            .sizing_viewer(id)
+            .and_then(|v| self.slot(v))
+            .map_or_else(|| self.av().size(), |s| s.viewer.size());
+        let size = self.clamp_size(id, viewer_size);
         self.commands.push(WindowCommand::Configure {
             window: id,
             size: Some(size),
@@ -235,12 +391,153 @@ impl Shell {
         self.largest = size;
     }
 
+    /// The active viewer (the one under the pointer), or the spare viewer while there is no
+    /// display-backed one.
     pub fn viewer(&self) -> &Viewer {
-        &self.viewer
+        self.av()
     }
 
+    /// The active viewer, mutable (see [`Shell::viewer`]).
     pub fn viewer_mut(&mut self) -> &mut Viewer {
-        &mut self.viewer
+        self.av_mut()
+    }
+
+    /// The viewer of display `id`.
+    pub fn viewer_of(&self, id: ViewerId) -> Option<&Viewer> {
+        self.viewers.iter().find(|s| s.id == id).map(|s| &s.viewer)
+    }
+
+    /// The display-backed viewers, in the order they were added.
+    pub fn viewers(&self) -> impl Iterator<Item = (ViewerId, &Viewer)> {
+        self.viewers.iter().map(|s| (s.id, &s.viewer))
+    }
+
+    /// The active viewer's id (FR-019).
+    pub fn active(&self) -> Option<ViewerId> {
+        self.active
+    }
+
+    /// The display the pointer is on and its position there (where to draw it).
+    pub fn pointer(&self) -> Option<(ViewerId, Point)> {
+        self.layout.locate(self.layout.pointer())
+    }
+
+    /// The layout of the displays (positions for `wl_output`).
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    /// Adds the viewer of a display of logical `size`; `internal` for a built-in panel
+    /// (FR-018). Its camera starts at its home view (FR-020). Adding an existing id resizes it.
+    pub fn add_viewer(&mut self, id: ViewerId, size: Size, internal: bool) {
+        let connected_seq = match self.layout.entries().iter().find(|e| e.id == id) {
+            Some(e) => e.connected_seq,
+            None => {
+                self.next_seq += 1;
+                self.next_seq
+            }
+        };
+        let existing = self.viewers.iter().any(|s| s.id == id);
+        self.layout.add(LayoutEntry {
+            id,
+            size,
+            internal,
+            connected_seq,
+        });
+        if !existing {
+            let mut viewer = Viewer::new();
+            viewer.set_bindings(self.bindings.clone());
+            viewer.set_camera(self.layout.home(id).unwrap_or_default());
+            self.viewers.push(ViewerSlot {
+                id,
+                viewer,
+                fullscreen: None,
+            });
+        }
+        let mut resized = false;
+        if let Some(slot) = self.slot_mut(id) {
+            let before = slot.viewer.size();
+            slot.viewer.configure(size);
+            resized = existing && slot.viewer.size() != before;
+        }
+        self.sync_active();
+        if resized {
+            self.viewer_resized(id);
+        }
+        self.dirty = true;
+    }
+
+    /// Removes the viewer of a display that went away (FR-021): its fullscreen window gets
+    /// its previous place and size back, maximized windows stay as they are; with the pointer
+    /// on it, a pan, move or resize ends as on a broken grab, and the pointer moves to the
+    /// centre of the leftmost display. Returns input for applications (a pointer leave).
+    pub fn remove_viewer(&mut self, id: ViewerId) -> Vec<ClientInput> {
+        let mut out = Vec::new();
+        if self.slot(id).is_none() {
+            return out;
+        }
+        self.exit_fullscreen_on(id, false);
+        if self.active == Some(id) {
+            self.router.grab = None;
+            self.finish_operation();
+            self.leave(&mut out);
+        }
+        self.viewers.retain(|s| s.id != id);
+        self.layout.remove(id);
+        if self.pan_viewer == Some(id) {
+            self.pan_viewer = None;
+        }
+        self.sync_active();
+        self.dirty = true;
+        out
+    }
+
+    /// Gives every viewer the home view of the whole row and moves its camera there, with the
+    /// pointer in the centre of the leftmost display; called once the displays present at
+    /// startup are known (FR-009, FR-020).
+    pub fn place_home_views(&mut self) {
+        self.layout.recentre_homes();
+        for slot in &mut self.viewers {
+            slot.viewer
+                .set_camera(self.layout.home(slot.id).unwrap_or_default());
+        }
+        self.sync_active();
+    }
+
+    /// The active viewer follows the pointer's display, and knows where the pointer is on it
+    /// (the pointer exists from the start, so a press before any motion still pans). Windows
+    /// learn about the pointer with its next motion.
+    fn sync_active(&mut self) {
+        let pointer = self.pointer();
+        self.active = pointer.map(|(id, _)| id);
+        if let Some((id, pos)) = pointer
+            && let Some(slot) = self.viewers.iter_mut().find(|s| s.id == id)
+        {
+            slot.viewer.handle(&InputEvent::PointerEnter { pos });
+        }
+    }
+
+    fn av(&self) -> &Viewer {
+        self.active
+            .and_then(|id| self.viewers.iter().find(|s| s.id == id))
+            .map_or(&self.spare, |s| &s.viewer)
+    }
+
+    fn av_mut(&mut self) -> &mut Viewer {
+        match self
+            .active
+            .and_then(|id| self.viewers.iter().position(|s| s.id == id))
+        {
+            Some(i) => &mut self.viewers[i].viewer,
+            None => &mut self.spare,
+        }
+    }
+
+    /// The active viewer's home view (the canvas origin at 100% without displays).
+    fn active_home(&self) -> Camera {
+        self.active
+            .and_then(|id| self.layout.home(id))
+            .unwrap_or_default()
     }
 
     pub fn windows(&self) -> &Windows {
@@ -291,29 +588,47 @@ impl Shell {
             WindowEvent::ResizeRequested { id, edges } => {
                 self.resize_requested(id, edges, &mut out);
             }
-            // Only the focused window may change these states (FR-019).
-            WindowEvent::MaximizeRequested { id, on } if self.windows.focus() == Some(id) => {
+            // Only the focused window may change these states (FR-019), and only while there
+            // is a display (spec Edge Cases "No display at all").
+            WindowEvent::MaximizeRequested { id, on }
+                if self.windows.focus() == Some(id) && !self.viewers.is_empty() =>
+            {
                 if on {
                     self.maximize(id, true, true, &mut out);
                 } else {
                     self.unmaximize(id);
                 }
             }
-            WindowEvent::FullscreenRequested { id, on } if self.windows.focus() == Some(id) => {
+            WindowEvent::FullscreenRequested { id, on, output }
+                if self.windows.focus() == Some(id) && !self.viewers.is_empty() =>
+            {
                 if on {
-                    self.enter_fullscreen(id, true, &mut out);
-                } else if self.is_fullscreen(id) {
-                    self.exit_fullscreen(true);
+                    self.enter_fullscreen(id, output, true, &mut out);
+                } else if let Some((viewer, _)) = self.fs_of(id) {
+                    self.exit_fullscreen_on(viewer, true);
                 }
             }
             WindowEvent::MaximizeRequested { .. } | WindowEvent::FullscreenRequested { .. } => {}
+            WindowEvent::CursorHidden { id, hidden } => {
+                let before = self.cursor_hidden.contains(&id);
+                if hidden && !before {
+                    self.cursor_hidden.push(id);
+                } else if !hidden {
+                    self.cursor_hidden.retain(|w| *w != id);
+                }
+            }
             WindowEvent::Unmapped { id } => {
                 self.windows.unmap(id);
+                self.cursor_hidden.retain(|w| *w != id);
                 self.settling.retain(|w| *w != id);
                 self.initial.retain(|i| i.window != id);
-                if let Some(fs) = self.fullscreen.take_if(|f| f.window == id) {
-                    // The view returns to where it was before fullscreen.
-                    self.viewer.set_camera(fs.saved_camera);
+                self.maximized_on.retain(|(w, _)| *w != id);
+                if let Some((viewer, fs)) = self.fs_of(id) {
+                    // That viewer returns to where it was before fullscreen.
+                    if let Some(slot) = self.slot_mut(viewer) {
+                        slot.fullscreen = None;
+                        slot.viewer.set_camera(fs.saved_camera);
+                    }
                 }
                 if self.router.grab.as_ref().is_some_and(|g| g.window == id) {
                     self.router.grab = None;
@@ -351,7 +666,8 @@ impl Shell {
         fullscreen: bool,
     ) {
         let unfocused = self.opens_unfocused(parent);
-        if unfocused || !(maximized || fullscreen) {
+        // Without a display the states are not granted (spec Edge Cases).
+        if unfocused || !(maximized || fullscreen) || self.viewers.is_empty() {
             self.commands.push(WindowCommand::Configure {
                 window: id,
                 size: None,
@@ -368,7 +684,7 @@ impl Shell {
         self.initial.push(init);
         self.commands.push(WindowCommand::Configure {
             window: id,
-            size: Some(limits.clamp(self.viewer.size(), self.largest)),
+            size: Some(limits.clamp(self.av().size(), self.largest)),
             states: States {
                 maximized,
                 fullscreen,
@@ -378,9 +694,9 @@ impl Shell {
     }
 
     /// Whether a new window with `parent` opens without focus: while another window is
-    /// fullscreen, unless it is that window's dialog (FR-020).
+    /// fullscreen on the active viewer, unless it is that window's dialog (FR-020, FR-022).
     fn opens_unfocused(&self, parent: Option<WindowId>) -> bool {
-        self.fullscreen
+        self.active_fs()
             .is_some_and(|f| parent.is_none_or(|p| p != f.window))
     }
 
@@ -400,7 +716,7 @@ impl Shell {
             .position(|i| i.window == id)
             .map(|i| self.initial.remove(i));
         if self.opens_unfocused(parent)
-            && let Some(fs) = self.fullscreen
+            && let Some(fs) = self.active_fs()
         {
             // Behind the fullscreen window, centred in the view it returns to (FR-020).
             self.windows
@@ -417,11 +733,15 @@ impl Shell {
             }
             return;
         }
-        if self.fullscreen.is_some() {
+        if self.active_fs().is_some() {
             // A dialog of the fullscreen window: fullscreen ends first.
             self.exit_fullscreen(true);
         }
-        let center = self.viewer.camera().center;
+        // Centred in the active viewer; without a display, on the canvas origin (FR-022).
+        let center = match self.active {
+            Some(_) => self.av().camera().center,
+            None => Point::new(0.0, 0.0),
+        };
         self.windows.map(id, size, input, center);
         self.windows.set_limits(id, limits);
         self.windows.set_parent(id, parent);
@@ -431,7 +751,7 @@ impl Shell {
                 self.maximize(id, false, false, out);
             }
             if init.fullscreen {
-                self.enter_fullscreen(id, false, out);
+                self.enter_fullscreen(id, None, false, out);
             }
         }
     }
@@ -447,7 +767,10 @@ impl Shell {
             return;
         }
         let rect = w.rect();
-        if let Some(fs) = self.fullscreen.filter(|f| f.window == id) {
+        let Some(viewer) = self.window_viewer(id) else {
+            return;
+        };
+        if let Some((fs_viewer, fs)) = self.fs_of(id) {
             // Maximized under fullscreen: shown when fullscreen ends.
             self.windows.set_mode(
                 id,
@@ -455,6 +778,8 @@ impl Shell {
                     saved: Some(fs.saved_rect),
                 },
             );
+            self.maximized_on.retain(|(w, _)| *w != id);
+            self.maximized_on.push((id, fs_viewer));
             if send {
                 self.configure_viewer_size(id);
             }
@@ -467,10 +792,13 @@ impl Shell {
                 saved: save.then_some(rect),
             },
         );
+        self.maximized_on.retain(|(w, _)| *w != id);
+        self.maximized_on.push((id, viewer));
         self.windows
             .set_anchor(id, Anchor::Centre { point: center });
         self.settling.retain(|w| *w != id);
-        self.viewer.set_camera(Camera { center, zoom: 1.0 });
+        // Only that viewer's camera moves (FR-022).
+        self.set_camera_of(viewer, Camera { center, zoom: 1.0 });
         self.focus_and_raise(id, out);
         if send {
             self.configure_viewer_size(id);
@@ -484,11 +812,12 @@ impl Shell {
             return;
         };
         self.windows.set_mode(id, Mode::Normal);
-        if let Some(fs) = &mut self.fullscreen
-            && fs.window == id
-        {
+        self.maximized_on.retain(|(w, _)| *w != id);
+        if let Some((viewer, _)) = self.fs_of(id) {
             // Under fullscreen: leaving fullscreen will return to the normal rect.
-            if let Some(rect) = saved {
+            if let Some(rect) = saved
+                && let Some(fs) = self.slot_mut(viewer).and_then(|s| s.fullscreen.as_mut())
+            {
                 fs.saved_rect = rect;
             }
             self.configure_viewer_size(id);
@@ -528,45 +857,75 @@ impl Shell {
         self.dirty = true;
     }
 
-    /// Fullscreen for `id` (FR-014, research W8): only it is shown, at 100%, centred.
-    fn enter_fullscreen(&mut self, id: WindowId, send: bool, out: &mut Vec<ClientInput>) {
-        if self.is_fullscreen(id) {
+    /// Fullscreen for `id` (FR-014, research W8) on the viewer of `output` if that is a display,
+    /// else on the window's viewer (FR-022): only it is shown there, at 100%, centred.
+    fn enter_fullscreen(
+        &mut self,
+        id: WindowId,
+        output: Option<ViewerId>,
+        send: bool,
+        out: &mut Vec<ClientInput>,
+    ) {
+        let Some(viewer) = output
+            .filter(|v| self.slot(*v).is_some())
+            .or_else(|| self.window_viewer(id))
+        else {
             return;
+        };
+        match self.fs_of(id) {
+            Some((on, _)) if on == viewer => return,
+            // Fullscreen elsewhere: it moves to this viewer.
+            Some((on, _)) => self.exit_fullscreen_on(on, true),
+            None => {}
         }
-        // One fullscreen window: the earlier one leaves first, so the saved view is always
-        // the one from before any fullscreen.
-        self.exit_fullscreen(true);
+        // One fullscreen window per viewer: the earlier one leaves first, so the saved view is
+        // always the one from before any fullscreen.
+        self.exit_fullscreen_on(viewer, true);
         let Some(rect) = self.windows.get(id).map(Window::rect) else {
             return;
         };
-        self.fullscreen = Some(Fullscreen {
-            window: id,
-            saved_rect: rect,
-            saved_camera: self.viewer.camera(),
-        });
         let center = rect.origin + rect.size.to_vector() / 2.0;
+        if let Some(slot) = self.slot_mut(viewer) {
+            slot.fullscreen = Some(Fullscreen {
+                window: id,
+                saved_rect: rect,
+                saved_camera: slot.viewer.camera(),
+            });
+            slot.viewer.set_camera(Camera { center, zoom: 1.0 });
+        }
         self.windows
             .set_anchor(id, Anchor::Centre { point: center });
         self.settling.retain(|w| *w != id);
-        self.viewer.set_camera(Camera { center, zoom: 1.0 });
         self.focus_and_raise(id, out);
         if send {
             self.configure_viewer_size(id);
         }
-        if let Some(p) = self.pointer_canvas() {
+        if self.active == Some(viewer)
+            && let Some(p) = self.pointer_canvas()
+        {
             self.retarget(p, false, out);
         }
         self.dirty = true;
     }
 
-    /// Ends fullscreen: the window returns to its saved rect (or to maximized), and with
-    /// `restore_camera` the view returns too.
+    /// Ends the active viewer's fullscreen (see [`Shell::exit_fullscreen_on`]).
     fn exit_fullscreen(&mut self, restore_camera: bool) {
-        let Some(fs) = self.fullscreen.take() else {
+        if let Some(id) = self.active {
+            self.exit_fullscreen_on(id, restore_camera);
+        }
+    }
+
+    /// Ends viewer `id`'s fullscreen: the window returns to its saved rect (or to maximized),
+    /// and with `restore_camera` that viewer's view returns too.
+    fn exit_fullscreen_on(&mut self, id: ViewerId, restore_camera: bool) {
+        let Some(slot) = self.slot_mut(id) else {
+            return;
+        };
+        let Some(fs) = slot.fullscreen.take() else {
             return;
         };
         if restore_camera {
-            self.viewer.set_camera(fs.saved_camera);
+            slot.viewer.set_camera(fs.saved_camera);
         }
         self.dirty = true;
         let Some(mode) = self.windows.get(fs.window).map(|w| w.mode) else {
@@ -650,10 +1009,10 @@ impl Shell {
     fn resize_op(&mut self, window: WindowId, edges: Edges) -> Option<Op> {
         let mut start_rect = self.windows.get(window)?.rect();
         let mut restored = false;
-        if let Some(fs) = self.fullscreen.filter(|f| f.window == window) {
+        if let Some((viewer, fs)) = self.fs_of(window) {
             // An application's resize request on its fullscreen window leaves fullscreen and
             // continues from the saved rect (FR-014).
-            self.exit_fullscreen(true);
+            self.exit_fullscreen_on(viewer, true);
             start_rect = fs.saved_rect;
             restored = true;
         }
@@ -704,7 +1063,8 @@ impl Shell {
     }
 
     /// One focus-cycling step: focus and raise the next window in the history and bring it
-    /// into view (FR-011, FR-012).
+    /// into the active viewer, unless it is already fully inside some viewer (FR-011, FR-012,
+    /// FR-022).
     fn cycle(&mut self, step: i32, out: &mut Vec<ClientInput>) {
         let before = self.windows.focus();
         let Some(id) = self.windows.cycle(step) else {
@@ -715,7 +1075,15 @@ impl Shell {
         let Some(rect) = self.windows.get(id).map(Window::rect) else {
             return;
         };
-        if let Some(mut camera) = reveal(self.viewer.camera(), self.viewer.size(), rect) {
+        let shown = self.is_fullscreen(id)
+            || self.viewers.iter().any(|s| {
+                Some(s.id) != self.active
+                    && reveal(s.viewer.camera(), s.viewer.size(), rect).is_none()
+            });
+        if self.active.is_none() || shown {
+            return;
+        }
+        if let Some(mut camera) = reveal(self.av().camera(), self.av().size(), rect) {
             if matches!(
                 self.windows.get(id).map(|w| w.mode),
                 Some(Mode::Maximized { .. })
@@ -726,7 +1094,7 @@ impl Shell {
                     zoom: 1.0,
                 };
             }
-            self.viewer.set_camera(camera);
+            self.av_mut().set_camera(camera);
             // A different window may be under the pointer now.
             if let Some(p) = self.pointer_canvas() {
                 self.retarget(p, false, out);
@@ -746,9 +1114,10 @@ impl Shell {
         }
     }
 
-    /// The window accepting input at canvas point `p`; while a window is fullscreen, only it.
+    /// The window accepting input at canvas point `p`; while a window is fullscreen on the
+    /// active viewer, only it.
     fn hit(&self, p: Point) -> Option<(WindowId, Point)> {
-        match self.fullscreen {
+        match self.active_fs() {
             Some(fs) => self
                 .windows
                 .hit_window(fs.window, p)
@@ -789,11 +1158,11 @@ impl Shell {
     /// grabbed point at the same relative x and the same y offset (spec Edge Cases, FR-014);
     /// returns the offset for the move.
     fn restore_for_move(&mut self, window: WindowId, mut offset: Vector) -> Vector {
-        if let Some(fs) = self.fullscreen.filter(|f| f.window == window) {
+        if let Some((viewer, fs)) = self.fs_of(window) {
             // The window still has its fullscreen size until the application answers, so
             // scale by the saved rect.
             let width = self.windows.get(window).map_or(0.0, |w| w.size.w);
-            self.exit_fullscreen(true);
+            self.exit_fullscreen_on(viewer, true);
             if width > 0.0 {
                 offset = Vector::new(offset.x * fs.saved_rect.size.w / width, offset.y);
             }
@@ -861,7 +1230,7 @@ impl Shell {
         }
     }
 
-    /// Ends the running operation, if any (also on a host pointer leave). A resize asks for
+    /// Ends the running operation, if any (also on a pointer leave). A resize asks for
     /// its last size without `resizing` and waits for it to settle (research W4).
     fn finish_operation(&mut self) -> bool {
         let Some(operation) = self.router.operation.take() else {
@@ -894,19 +1263,47 @@ impl Shell {
 
     /// The canvas rectangle the viewer shows.
     pub fn view_rect(&self) -> Rect {
-        let size = self.viewer.size();
-        let camera = self.viewer.camera();
-        let top_left = camera.to_canvas(Point::new(0.0, 0.0), size);
-        Rect::new(
-            top_left,
-            Size::new(size.w / camera.zoom, size.h / camera.zoom),
-        )
+        view_rect_of(self.av())
+    }
+
+    /// Windows shown on display `id`, back to front; while a window is fullscreen there, only
+    /// it.
+    pub fn visible_in(&self, id: ViewerId) -> Vec<WindowId> {
+        match self.slot(id) {
+            Some(ViewerSlot {
+                fullscreen: Some(fs),
+                ..
+            }) => vec![fs.window],
+            Some(slot) => self.windows.visible(view_rect_of(&slot.viewer)),
+            None => Vec::new(),
+        }
+    }
+
+    /// Windows shown on any display, back to front (they get frame callbacks).
+    pub fn visible_any(&self) -> Vec<WindowId> {
+        let shown: Vec<Vec<WindowId>> =
+            self.viewers.iter().map(|s| self.visible_in(s.id)).collect();
+        self.windows
+            .iter()
+            .map(|w| w.id)
+            .filter(|id| shown.iter().any(|v| v.contains(id)))
+            .collect()
+    }
+
+    /// The displays that need a new frame (their view or the windows changed); clears the
+    /// flags.
+    pub fn take_dirty_viewers(&mut self) -> Vec<ViewerId> {
+        let all = std::mem::take(&mut self.dirty);
+        self.viewers
+            .iter_mut()
+            .filter_map(|s| (s.viewer.take_dirty() || all).then_some(s.id))
+            .collect()
     }
 
     /// Windows that at least partly intersect the view, back to front (FR-006); while a
     /// window is fullscreen, only it (FR-014).
     pub fn visible(&self) -> Vec<WindowId> {
-        match self.fullscreen {
+        match self.active_fs() {
             Some(fs) => vec![fs.window],
             None => self.windows.visible(self.view_rect()),
         }
@@ -914,37 +1311,47 @@ impl Shell {
 
     /// Whether a new frame is needed (the view or the windows changed); clears the flag.
     pub fn take_dirty(&mut self) -> bool {
-        let viewer = self.viewer.take_dirty();
+        let viewer = self.av_mut().take_dirty();
         std::mem::take(&mut self.dirty) || viewer
     }
 
     /// Handles one input event: canvas navigation or input for an application.
     pub fn handle(&mut self, event: &InputEvent) -> (Effect, Vec<ClientInput>) {
         let mut out = Vec::new();
+        let panned = self.pan_viewer.is_some();
         let effect = match *event {
             InputEvent::PointerEnter { pos } | InputEvent::PointerMotion { pos } => {
+                // An absolute position on the active viewer: keep the layout's pointer in step.
+                if let Some(origin) = self.active.and_then(|id| self.layout.origin(id)) {
+                    self.layout
+                        .move_to(Point::new(origin.x + pos.x, origin.y + pos.y));
+                }
                 self.pointer_moved(event, pos, &mut out);
                 Effect::default()
             }
             InputEvent::PointerLeave => {
-                // During a grab the host keeps sending to us, so a leave means it broke the
-                // grab: it ends, and so does an operation, as on the last release.
+                // A leave breaks the grab (the console was switched away, research S23): it
+                // ends, and so does an operation, as on the last release.
                 self.router.grab = None;
                 self.finish_operation();
                 self.leave(&mut out);
-                self.viewer.handle(event)
+                self.av_mut().handle(event);
+                Effect::default()
             }
             InputEvent::PointerButton {
                 button,
                 code,
                 pressed,
-            } => self.button(event, button, code, pressed, &mut out),
+            } => self.button(button, code, pressed, &mut out),
             InputEvent::Scroll {
                 source,
                 delta,
                 value120,
-            } => self.scroll(event, source, delta, value120, &mut out),
-            InputEvent::PinchBegin if self.fullscreen.is_some() => {
+            } => {
+                self.scroll(event, source, delta, value120, &mut out);
+                Effect::default()
+            }
+            InputEvent::PinchBegin if self.active_fs().is_some() => {
                 // Leaves fullscreen and is consumed (contracts/input.md).
                 self.exit_fullscreen(true);
                 Effect::default()
@@ -952,27 +1359,36 @@ impl Shell {
             InputEvent::PinchBegin
             | InputEvent::PinchUpdate { .. }
             | InputEvent::PinchEnd { .. } => {
-                let effect = self.viewer.handle(event);
+                self.av_mut().handle(event);
                 self.update_operation();
-                effect
+                Effect::default()
             }
             InputEvent::Key {
                 keycode,
                 binding_sym,
                 pressed,
-            } => self.key(event, keycode, binding_sym, pressed, &mut out),
+                time_ms,
+            } => self.key(keycode, binding_sym, pressed, time_ms, &mut out),
+            InputEvent::PointerMoved { delta } => {
+                self.relative_motion(delta, &mut out);
+                Effect::default()
+            }
             InputEvent::Modifiers { mods, raw } => {
                 self.router.mods = mods;
-                if !bindings::mod_held(mods) {
+                self.router.raw = raw;
+                if !self.bindings.mod_held(mods) {
                     // Releasing Mod commits the focus order (FR-011).
                     self.windows.end_cycle();
                 }
                 if let Some(window) = self.focused_window() {
                     out.push(ClientInput::Modifiers { window, raw });
                 }
-                self.viewer.handle(event)
+                self.av_mut().handle(event);
+                Effect::default()
             }
             InputEvent::FocusLost => {
+                // A console switch or lost keyboard cancels a pending quit (FR-031).
+                self.router.quit.cancel();
                 if self.router.viewer_focused && self.windows.focus().is_some() {
                     out.push(ClientInput::KeyboardFocus(None));
                 }
@@ -982,17 +1398,73 @@ impl Shell {
                 self.windows.end_cycle();
                 self.router.held_keys.clear();
                 self.router.consumed_keys.clear();
-                self.viewer.handle(event)
+                self.av_mut().handle(event);
+                Effect::default()
             }
             InputEvent::FocusGained => {
-                if !self.router.viewer_focused && self.windows.focus().is_some() {
-                    out.push(ClientInput::KeyboardFocus(self.windows.focus()));
+                if !self.router.viewer_focused
+                    && let Some(window) = self.windows.focus()
+                {
+                    self.give_keyboard(window, &mut out);
                 }
                 self.router.viewer_focused = true;
-                self.viewer.handle(event)
+                self.av_mut().handle(event);
+                Effect::default()
             }
         };
+        // A pan keeps acting on the viewer it started on until it ends (FR-019).
+        self.pan_viewer = if self.av().is_panning() {
+            self.pan_viewer.or(self.active)
+        } else {
+            // Also ended by the viewer itself (a pointer leave, the keyboard lost).
+            self.router.pan_button = None;
+            None
+        };
+        if panned && self.pan_viewer.is_none() {
+            self.follow_pointer(&mut out);
+        }
         (effect, out)
+    }
+
+    /// Once a pan is over, the viewer under the pointer is the active one again, without
+    /// waiting for the next motion (FR-019). Returns whether it changed (and the pointer was
+    /// re-targeted on the new viewer).
+    fn follow_pointer(&mut self, out: &mut Vec<ClientInput>) -> bool {
+        let on = self.pointer().map(|(id, _)| id);
+        if on.is_none() || on == self.active {
+            return false;
+        }
+        if let Some(slot) = self
+            .active
+            .and_then(|id| self.viewers.iter_mut().find(|s| s.id == id))
+        {
+            slot.viewer.handle(&InputEvent::PointerLeave);
+        }
+        self.sync_active();
+        if let Some(p) = self.pointer_canvas() {
+            self.retarget(p, false, out);
+        }
+        true
+    }
+
+    /// Relative pointer motion: the layout moves the pointer, and the viewer it is on (or the
+    /// one a pan started on) gets the position relative to its top-left corner (research S9).
+    fn relative_motion(&mut self, delta: Vector, out: &mut Vec<ClientInput>) {
+        self.layout.move_by(delta);
+        let pointer = self.layout.pointer();
+        let target = self
+            .pan_viewer
+            .or_else(|| self.layout.locate(pointer).map(|(id, _)| id));
+        let Some(target) = target else {
+            return;
+        };
+        if self.pan_viewer.is_none() {
+            self.active = Some(target);
+        }
+        let Some(pos) = self.layout.relative_to(target, pointer) else {
+            return;
+        };
+        self.pointer_moved(&InputEvent::PointerMotion { pos }, pos, out);
     }
 
     /// The focused window, if the viewer has the keyboard.
@@ -1002,15 +1474,30 @@ impl Shell {
 
     fn focus_changed(&self, before: Option<WindowId>, out: &mut Vec<ClientInput>) {
         let now = self.windows.focus();
-        if now != before && self.router.viewer_focused {
-            out.push(ClientInput::KeyboardFocus(now));
+        if now == before || !self.router.viewer_focused {
+            return;
         }
+        match now {
+            Some(window) => self.give_keyboard(window, out),
+            None => out.push(ClientInput::KeyboardFocus(None)),
+        }
+    }
+
+    /// Gives `window` the keyboard, telling it the current modifiers first: they may have
+    /// changed while no window had the keyboard (a Mod released after Mod+Q closed the last
+    /// window), and `wl_keyboard.enter` carries them.
+    fn give_keyboard(&self, window: WindowId, out: &mut Vec<ClientInput>) {
+        out.push(ClientInput::Modifiers {
+            window,
+            raw: self.router.raw,
+        });
+        out.push(ClientInput::KeyboardFocus(Some(window)));
     }
 
     /// The pointer position on the canvas, if it is over the viewer.
     fn pointer_canvas(&self) -> Option<Point> {
-        let pos = self.viewer.pointer()?;
-        Some(self.viewer.camera().to_canvas(pos, self.viewer.size()))
+        let pos = self.av().pointer()?;
+        Some(self.av().camera().to_canvas(pos, self.av().size()))
     }
 
     /// `p` (canvas) in the coordinates of `window`.
@@ -1020,17 +1507,17 @@ impl Shell {
     }
 
     fn pointer_moved(&mut self, event: &InputEvent, pos: Point, out: &mut Vec<ClientInput>) {
-        self.viewer.handle(event);
+        self.av_mut().handle(event);
         if self.router.operation.is_some() {
             // The window being moved or resized gets no pointer input (research W3).
             self.update_operation();
             return;
         }
-        if self.viewer.is_panning() {
+        if self.av().is_panning() {
             // A canvas pan: applications get nothing (FR-012).
             return;
         }
-        let canvas = self.viewer.camera().to_canvas(pos, self.viewer.size());
+        let canvas = self.av().camera().to_canvas(pos, self.av().size());
         if let Some(grab) = &self.router.grab {
             let window = grab.window;
             if let Some(local) = self.local(window, canvas) {
@@ -1076,7 +1563,6 @@ impl Shell {
 
     fn button(
         &mut self,
-        event: &InputEvent,
         button: Button,
         code: u32,
         pressed: bool,
@@ -1094,6 +1580,13 @@ impl Shell {
             }
             return Effect::default();
         }
+        if let Some(pan) = self.router.pan_button {
+            // During a pan other buttons do nothing; the release of its own button ends it.
+            if !pressed && pan == code {
+                self.end_pan(out);
+            }
+            return Effect::default();
+        }
         if pressed {
             if let Some(grab) = &mut self.router.grab {
                 grab.buttons.push(code);
@@ -1107,46 +1600,39 @@ impl Shell {
                 return Effect::default();
             }
             let hit = self.pointer_canvas().and_then(|p| self.hit(p));
-            let mod_held = bindings::mod_held(self.router.mods);
-            if button == Button::Left
-                && mod_held
-                && self.router.mods.shift
-                && let Some((window, _)) = hit
-            {
-                // Mod + Shift + left on a window moves it (FR-002); on a fullscreen window
-                // it leaves fullscreen first.
-                self.start_move(window, code, out);
-                return Effect::default();
+            // The pointer bindings (FR-032, contracts/config.md "Pointer combinations").
+            match (self.bindings.pointer_lookup(self.router.mods, button), hit) {
+                (Some(PointerAction::MoveWindow), Some((window, _))) => {
+                    // Focus, raise, move (FR-002); a fullscreen or maximized window gets its
+                    // earlier size first.
+                    self.start_move(window, code, out);
+                    return Effect::default();
+                }
+                (Some(PointerAction::ResizeWindow), Some((window, _))) => {
+                    if self.active_fs().is_some() {
+                        // Leaves fullscreen and is consumed (contracts/input.md).
+                        self.exit_fullscreen(true);
+                    } else {
+                        self.start_resize(window, code, out);
+                    }
+                    return Effect::default();
+                }
+                (Some(PointerAction::ResizeWindow), None) => return Effect::default(),
+                // Over the background a move pans; a pan pans anywhere, without focus.
+                (Some(PointerAction::MoveWindow | PointerAction::PanCanvas), _) => {
+                    self.pan_or_leave_fullscreen(code, out);
+                    return Effect::default();
+                }
+                (None, _) => {}
             }
-            if self.fullscreen.is_some()
-                && ((button == Button::Right && mod_held && hit.is_some())
-                    || (button == Button::Left && (mod_held || hit.is_none())))
-            {
-                // A resize gesture, a pan press or a press on the uncovered background leaves
-                // fullscreen and is consumed (contracts/input.md).
-                self.exit_fullscreen(true);
-                return Effect::default();
-            }
-            if button == Button::Right
-                && mod_held
-                && let Some((window, _)) = hit
-            {
-                // Mod + right (Shift ignored) on a window resizes it (FR-006).
-                self.start_resize(window, code, out);
-                return Effect::default();
-            }
-            if button == Button::Left && bindings::mod_held(self.router.mods) {
-                // Mod + left pans anywhere and does not focus (FR-012).
-                self.leave(out);
-                return self.viewer.handle(event);
-            }
+            // An ordinary click.
             let Some((window, local)) = hit else {
-                // The background: left pans, other buttons do nothing; focus stays (FR-013).
-                return if button == Button::Left {
-                    self.viewer.handle(event)
-                } else {
-                    Effect::default()
-                };
+                // The background: left pans (or leaves fullscreen), other buttons do nothing;
+                // focus stays (FR-013).
+                if button == Button::Left {
+                    self.pan_or_leave_fullscreen(code, out);
+                }
+                return Effect::default();
             };
             let before = self.windows.focus();
             self.windows.raise_and_focus(window);
@@ -1185,17 +1671,34 @@ impl Shell {
                     self.retarget(p, false, out);
                 }
             }
-            return Effect::default();
         }
-        let was_panning = self.viewer.is_panning();
-        let effect = self.viewer.handle(event);
-        if was_panning
-            && !self.viewer.is_panning()
+        Effect::default()
+    }
+
+    /// A pan press: with a fullscreen window on the active viewer it leaves fullscreen and is
+    /// consumed (contracts/input.md); otherwise the active viewer pans until `code` is released.
+    fn pan_or_leave_fullscreen(&mut self, code: u32, out: &mut Vec<ClientInput>) {
+        if self.active_fs().is_some() {
+            self.exit_fullscreen(true);
+            return;
+        }
+        // Applications get nothing during a pan (FR-012).
+        self.leave(out);
+        if self.av_mut().begin_pan() {
+            self.router.pan_button = Some(code);
+        }
+    }
+
+    /// The pan's button was released: the pointer re-enters the window under it.
+    fn end_pan(&mut self, out: &mut Vec<ClientInput>) {
+        self.av_mut().end_pan();
+        self.router.pan_button = None;
+        self.pan_viewer = None;
+        if !self.follow_pointer(out)
             && let Some(p) = self.pointer_canvas()
         {
             self.retarget(p, false, out);
         }
-        effect
     }
 
     fn scroll(
@@ -1205,15 +1708,14 @@ impl Shell {
         delta: Vector,
         value120: Option<Vector>,
         out: &mut Vec<ClientInput>,
-    ) -> Effect {
+    ) {
         if self.router.operation.is_some() {
             // Mod + scroll zooms around the pointer; plain scrolling does nothing.
-            if !bindings::mod_held(self.router.mods) {
-                return Effect::default();
+            if self.bindings.mod_held(self.router.mods) {
+                self.av_mut().handle(event);
+                self.update_operation();
             }
-            let effect = self.viewer.handle(event);
-            self.update_operation();
-            return effect;
+            return;
         }
         let target = match &self.router.grab {
             Some(grab) => Some(grab.window),
@@ -1222,13 +1724,16 @@ impl Shell {
                 .and_then(|p| self.hit(p))
                 .map(|(id, _)| id),
         };
-        if self.fullscreen.is_some() && (bindings::mod_held(self.router.mods) || target.is_none()) {
+        if self.active_fs().is_some()
+            && (self.bindings.mod_held(self.router.mods) || target.is_none())
+        {
             // Zooming or scrolling the canvas leaves fullscreen and is consumed.
             self.exit_fullscreen(true);
-            return Effect::default();
+            return;
         }
-        if self.viewer.is_panning() || bindings::mod_held(self.router.mods) {
-            return self.viewer.handle(event);
+        if self.av().is_panning() || self.bindings.mod_held(self.router.mods) {
+            self.av_mut().handle(event);
+            return;
         }
         match target {
             Some(window) => {
@@ -1239,22 +1744,26 @@ impl Shell {
                     value120,
                 });
                 out.push(ClientInput::PointerFrame { window });
-                Effect::default()
             }
-            None => self.viewer.handle(event),
+            None => self.av_mut().handle(event),
         }
     }
 
     fn key(
         &mut self,
-        event: &InputEvent,
         keycode: u32,
         sym: Keysym,
         pressed: bool,
+        time_ms: u32,
         out: &mut Vec<ClientInput>,
     ) -> Effect {
         if pressed {
-            if let Some(action) = bindings::lookup(self.router.mods, sym, true) {
+            let action = self.bindings.lookup(self.router.mods, sym, true);
+            // Any other key press cancels a pending quit; modifier keys do not (FR-031).
+            if action != Some(Action::Quit) && !sym.is_modifier_key() {
+                self.router.quit.cancel();
+            }
+            if let Some(action) = action {
                 self.router.consumed_keys.push(keycode);
                 let operating = self.router.operation.is_some();
                 return match action {
@@ -1264,7 +1773,7 @@ impl Shell {
                     {
                         Effect::default()
                     }
-                    Action::ResetView if self.fullscreen.is_some() => {
+                    Action::ResetView if self.active_fs().is_some() => {
                         // Leaves fullscreen instead (contracts/input.md).
                         self.exit_fullscreen(true);
                         Effect::default()
@@ -1283,7 +1792,22 @@ impl Shell {
                         }
                         Effect::default()
                     }
-                    Action::ResetView | Action::Quit => self.viewer.handle(event),
+                    Action::ResetView => {
+                        // The active viewer's home view (FR-019, FR-020).
+                        let home = self.active_home();
+                        self.av_mut().set_camera(home);
+                        Effect::default()
+                    }
+                    // Quitting takes two presses within 2 s, everywhere (FR-031).
+                    Action::Quit => Effect {
+                        quit: self.router.quit.press(time_ms),
+                        ..Effect::default()
+                    },
+                    // `App` starts the command (FR-014); the key is consumed with its release.
+                    Action::Spawn(n) => Effect {
+                        spawn: Some(n),
+                        ..Effect::default()
+                    },
                 };
             }
             if let Some(window) = self.focused_window() {

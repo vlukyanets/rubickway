@@ -4,7 +4,7 @@
     reason = "test setup helpers fail loudly; clippy.toml only exempts #[test] functions"
 )]
 
-use rubickway::input::bindings::{self, Action};
+use rubickway::input::bindings::{Action, Bindings};
 use rubickway::input::keyboard::Keyboard;
 use rubickway::input::{Keysym, Modifiers};
 use xkbcommon::xkb;
@@ -100,60 +100,72 @@ fn latched_modifiers_count() {
     );
 }
 
+/// Mod as `Bindings::default()` has it: Super.
+const SUPER: Modifiers = Modifiers {
+    logo: true,
+    ..Modifiers::NONE
+};
+
 #[test]
 fn mod_shift_q_is_quit() {
-    let alt_shift = Modifiers {
-        alt: true,
+    let super_shift = Modifiers {
         shift: true,
-        ..Modifiers::NONE
+        ..SUPER
     };
     assert_eq!(
-        bindings::lookup(alt_shift, Keysym::q, true),
+        Bindings::default().lookup(super_shift, Keysym::q, true),
         Some(Action::Quit)
     );
-    assert_eq!(bindings::lookup(alt_shift, Keysym::q, false), None);
+    assert_eq!(
+        Bindings::default().lookup(super_shift, Keysym::q, false),
+        None
+    );
     let with_ctrl = Modifiers {
         ctrl: true,
-        ..alt_shift
+        ..super_shift
     };
-    assert_eq!(bindings::lookup(with_ctrl, Keysym::q, true), None);
-    assert_eq!(bindings::lookup(Modifiers::NONE, Keysym::q, true), None);
+    assert_eq!(Bindings::default().lookup(with_ctrl, Keysym::q, true), None);
+    assert_eq!(
+        Bindings::default().lookup(Modifiers::NONE, Keysym::q, true),
+        None
+    );
 }
 
 #[test]
 fn mod_q_closes_and_mod_shift_q_quits() {
-    let alt = Modifiers {
-        alt: true,
-        ..Modifiers::NONE
-    };
     assert_eq!(
-        bindings::lookup(alt, Keysym::q, true),
+        Bindings::default().lookup(SUPER, Keysym::q, true),
         Some(Action::CloseWindow)
     );
-    let alt_shift = Modifiers { shift: true, ..alt };
+    let super_shift = Modifiers {
+        shift: true,
+        ..SUPER
+    };
     assert_eq!(
-        bindings::lookup(alt_shift, Keysym::q, true),
+        Bindings::default().lookup(super_shift, Keysym::q, true),
         Some(Action::Quit)
     );
 }
 
 #[test]
 fn mod_tab_and_mod_shift_tab_cycle_windows() {
-    let alt = Modifiers {
-        alt: true,
-        ..Modifiers::NONE
+    let super_shift = Modifiers {
+        shift: true,
+        ..SUPER
     };
-    let alt_shift = Modifiers { shift: true, ..alt };
     assert_eq!(
-        bindings::lookup(alt, Keysym::Tab, true),
+        Bindings::default().lookup(SUPER, Keysym::Tab, true),
         Some(Action::NextWindow)
     );
     assert_eq!(
-        bindings::lookup(alt_shift, Keysym::Tab, true),
+        Bindings::default().lookup(super_shift, Keysym::Tab, true),
         Some(Action::PreviousWindow)
     );
-    assert_eq!(bindings::lookup(Modifiers::NONE, Keysym::Tab, true), None);
-    assert_eq!(bindings::lookup(alt, Keysym::Tab, false), None);
+    assert_eq!(
+        Bindings::default().lookup(Modifiers::NONE, Keysym::Tab, true),
+        None
+    );
+    assert_eq!(Bindings::default().lookup(SUPER, Keysym::Tab, false), None);
 }
 
 #[test]
@@ -171,12 +183,28 @@ fn mod_0_is_reset_view_with_any_active_layout() {
         let mut s = Setup::new(layouts);
         let mods = s
             .keyboard
-            .update_mask(s.mask(&[xkb::MOD_NAME_ALT]), 0, 0, group);
+            .update_mask(s.mask(&[xkb::MOD_NAME_LOGO]), 0, 0, group);
         let sym = s.keyboard.binding_sym(KEY_0);
         assert_eq!(
-            bindings::lookup(mods, sym, true),
+            Bindings::default().lookup(mods, sym, true),
             Some(Action::ResetView),
             "{layouts}"
         );
     }
+}
+
+// --- Standalone: the fixed US English keymap (FR-007, research S17) ---------------------------
+
+#[test]
+fn the_fixed_keymap_is_us_english_only() {
+    let k = Keyboard::us().expect("US keymap");
+    assert_eq!(k.binding_sym(KEY_Q), Keysym::q);
+    assert_eq!(k.layout_count(), 1);
+}
+
+#[test]
+fn the_keymap_text_round_trips() {
+    let k = Keyboard::us().expect("US keymap");
+    let again = Keyboard::from_keymap_string(k.keymap_text()).expect("text compiles");
+    assert_eq!(again.binding_sym(KEY_Q), Keysym::q);
 }

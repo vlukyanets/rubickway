@@ -73,11 +73,6 @@ impl Camera {
         self.pan_anchor(under, p, size);
         true
     }
-
-    /// Back to the canvas origin at 100%.
-    pub fn reset(&mut self) {
-        *self = Camera::default();
-    }
 }
 
 #[cfg(test)]
@@ -236,15 +231,6 @@ mod pan_zoom_tests {
         assert!(close(camera.to_canvas(p, SIZE), before, 1e-9));
         camera.set_zoom_at(100.0, p, SIZE);
         assert_eq!(camera.zoom, ZOOM_MAX);
-    }
-
-    #[test]
-    fn reset_returns_to_the_default_view() {
-        let mut camera = Camera::default();
-        camera.pan_by(Vector::new(1234.5, -987.0));
-        camera.zoom_at(3.7, Point::new(10.0, 20.0), SIZE);
-        camera.reset();
-        assert_eq!(camera, Camera::default());
     }
 
     #[test]

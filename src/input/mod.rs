@@ -9,9 +9,13 @@ use crate::canvas::{Point, Vector};
 
 pub use xkbcommon::xkb::Keysym;
 
-/// One input event, already translated from the host or device representation.
+/// One input event, already translated from the device representation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputEvent {
+    /// The pointer moved by `delta` logical pixels (relative, accelerated motion from a
+    /// device). The shell turns it into per-viewer enter, motion and leave events through the
+    /// layout (research S9).
+    PointerMoved { delta: Vector },
     /// The pointer entered the viewer at `pos`.
     PointerEnter { pos: Point },
     /// The pointer moved to `pos` (may be outside the viewer during a drag).
@@ -24,8 +28,8 @@ pub enum InputEvent {
         code: u32,
         pressed: bool,
     },
-    /// One scroll frame. `delta` in logical pixels, positive `y` = scroll down, as delivered by
-    /// the host (natural scrolling already applied). `value120` is set for wheels: one notch is
+    /// One scroll frame. `delta` in logical pixels, positive `y` = scroll down, as libinput
+    /// delivers it (natural scrolling off). `value120` is set for wheels: one notch is
     /// 120, high-resolution wheels report fractions of it.
     Scroll {
         source: ScrollSource,
@@ -40,13 +44,15 @@ pub enum InputEvent {
     PinchEnd { cancelled: bool },
     /// A key changed state. `keycode` is the Linux evdev key code; `binding_sym` is the key's
     /// symbol in the first layout at the base level, so shortcuts work whatever layout is
-    /// active.
+    /// active. `time_ms` is the event time in milliseconds (wrapping), used for the two-press
+    /// quit (FR-031).
     Key {
         keycode: u32,
         binding_sym: Keysym,
         pressed: bool,
+        time_ms: u32,
     },
-    /// The modifiers changed: `mods` are the effective ones, `raw` the masks as the host sent
+    /// The modifiers changed: `mods` are the effective ones, `raw` the masks as xkb reports
     /// them (forwarded to applications).
     Modifiers { mods: Modifiers, raw: RawModifiers },
     /// The viewer lost keyboard or pointer focus.
@@ -72,6 +78,18 @@ pub enum Button {
     Middle,
     /// Any other button, by its Linux input event code.
     Other(u32),
+}
+
+impl Button {
+    /// The button for Linux input event code `code` (`BTN_LEFT` = 0x110, ...).
+    pub fn from_code(code: u32) -> Button {
+        match code {
+            0x110 => Button::Left,
+            0x111 => Button::Right,
+            0x112 => Button::Middle,
+            other => Button::Other(other),
+        }
+    }
 }
 
 /// What produced a scroll event.

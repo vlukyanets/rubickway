@@ -7,8 +7,8 @@ use wayland_server::protocol::wl_subcompositor::{self, WlSubcompositor};
 use wayland_server::protocol::wl_subsurface::{self, WlSubsurface};
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
-use super::ServerState;
 use super::compositor::{self, Role, StackEntry};
+use super::{ServerState, output};
 
 pub(crate) fn create_global(dh: &DisplayHandle) {
     dh.create_global::<ServerState, WlSubcompositor, ()>(1, ());
@@ -73,8 +73,9 @@ impl Dispatch<WlSubcompositor, ()> for ServerState {
         }
         if let Some(p) = state.surfaces.get_mut(&pid) {
             p.stack.push(StackEntry::Child(sid.clone()));
-            p.pending_stack.push(StackEntry::Child(sid));
+            p.pending_stack.push(StackEntry::Child(sid.clone()));
         }
+        output::cross_subtree(state, &sid, true);
     }
 }
 
@@ -117,6 +118,8 @@ impl Dispatch<WlSubsurface, ObjectId> for ServerState {
     }
 
     fn destroyed(state: &mut Self, _: ClientId, _: &WlSubsurface, surface: &ObjectId) {
+        // Leaving the window's tree, it is on none of its displays any more (FR-015).
+        output::cross_subtree(state, surface, false);
         let parent = state
             .surfaces
             .get_mut(surface)

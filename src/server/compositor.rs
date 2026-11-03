@@ -502,7 +502,8 @@ fn apply(state: &mut ServerState, id: &ObjectId, committed: SurfaceState) -> boo
     }
     committed.attach = None;
     surface.current = committed;
-    state.dirty = true;
+    // Only the displays showing this surface's window need a new frame (research S7).
+    state.damaged.push(id.clone());
     true
 }
 
@@ -715,23 +716,6 @@ pub(crate) fn announce_scale(state: &ServerState, id: &ObjectId) {
             s.resource.preferred_buffer_scale(integer);
         }
         if let Some(f) = &s.fractional {
-            f.preferred_scale(fractional);
-        }
-    }
-}
-
-/// Re-sends the scale to every surface that has been told before (mapped windows and
-/// surfaces with a fractional-scale object).
-pub(crate) fn announce_scale_all(state: &ServerState) {
-    let roots: Vec<ObjectId> = state.windows.values().cloned().collect();
-    for root in &roots {
-        announce_scale(state, root);
-    }
-    let (_, fractional) = state.scales();
-    for (id, s) in &state.surfaces {
-        if !roots.contains(id)
-            && let Some(f) = &s.fractional
-        {
             f.preferred_scale(fractional);
         }
     }

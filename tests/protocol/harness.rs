@@ -45,13 +45,16 @@ where
         _: &QueueHandle<Self>,
     ) {
         let any: Box<dyn Any> = Box::new(event);
-        if let Some(wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        }) = any.downcast_ref::<wl_registry::Event>()
-        {
-            state.globals.push((*name, interface.clone(), *version));
+        match any.downcast_ref::<wl_registry::Event>() {
+            Some(wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            }) => state.globals.push((*name, interface.clone(), *version)),
+            Some(wl_registry::Event::GlobalRemove { name }) => {
+                state.globals.retain(|(n, _, _)| n != name);
+            }
+            _ => {}
         }
         state.events.push(Recorded {
             object: proxy.id(),
@@ -85,6 +88,21 @@ impl Client {
             .find(|(_, i, _)| i == interface)
             .unwrap_or_else(|| panic!("no global {interface}"));
         self.registry.bind::<I, _, _>(*name, version, &self.qh, ())
+    }
+
+    /// Binds every advertised global named like `I`'s interface at `version`, in the order
+    /// they were advertised.
+    pub fn bind_all<I: Proxy + 'static>(&self, version: u32) -> Vec<I>
+    where
+        Recorder: Dispatch<I, ()>,
+    {
+        let interface = I::interface().name;
+        self.state
+            .globals
+            .iter()
+            .filter(|(_, i, _)| i == interface)
+            .map(|(name, _, _)| self.registry.bind::<I, _, _>(*name, version, &self.qh, ()))
+            .collect()
     }
 
     /// The events of type `E` received so far, with the object they arrived on.

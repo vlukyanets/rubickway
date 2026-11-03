@@ -173,14 +173,15 @@ fn case_4_a_client_that_never_reads_is_disconnected() {
     h.c(ci).paused = true;
     let display = h.c(ci).conn.display();
     let qh = h.c(ci).qh.clone();
-    // Every sync makes the server queue a callback and a delete_id event (~24 bytes).
-    for round in 0..200 {
+    // Every sync makes the server queue a callback and a delete_id event (~24 bytes). The
+    // client library buffers requests without limit, so only the server can end this.
+    for _ in 0..200 {
         for _ in 0..500 {
             display.sync(&qh, ());
         }
         let _ = h.c(ci).conn.flush();
         h.roundtrip();
-        if round % 20 == 0 && client_gone(&h.c(ci).conn) {
+        if client_gone(&h.c(ci).conn) {
             break;
         }
     }
@@ -195,8 +196,17 @@ fn case_4_a_client_that_never_reads_is_disconnected() {
     assert_good_client_works(&mut h, &good);
 }
 
+/// Whether the server has dropped the client: a protocol error, or the socket closed under it
+/// (what the pure-Rust client backend reports; a full socket is not "gone").
 fn client_gone(conn: &Connection) -> bool {
+    use std::io::ErrorKind;
+    use wayland_client::backend::WaylandError;
     conn.protocol_error().is_some()
+        || matches!(
+            conn.flush(),
+            Err(WaylandError::Io(e))
+                if matches!(e.kind(), ErrorKind::BrokenPipe | ErrorKind::ConnectionReset)
+        )
 }
 
 // Case 5: flooding.
@@ -372,4 +382,62 @@ fn a_client_gone_with_a_configure_queued_harms_no_one() {
     h.server.command(&[configure(id, 300.0, 300.0)]);
     h.roundtrip();
     assert_good_client_works(&mut h, &good);
+}
+
+// --- Standalone: activity while RubickWay is paused (spec Edge Cases, research S22) ----------
+
+#[test]
+fn a_client_flooding_frames_while_paused_gets_no_callback_until_resumed() {
+    let mut h = Harness::new();
+    let c = h.connect();
+    let g = globals(h.c(c));
+    let (w, id) = open_window(&mut h, c, &g, 10, 10, RED);
+    h.server.set_paused(true);
+    let qh = h.c(c).qh.clone();
+    let mut callbacks = Vec::new();
+    for i in 0..100u32 {
+        let (buffer, _pool, _file) = solid_buffer(h.c(c), &g.shm, 10, 10, RED ^ i);
+        w.surface.attach(Some(&buffer), 0, 0);
+        callbacks.push(w.surface.frame(&qh, ()));
+        w.surface.commit();
+    }
+    h.roundtrip();
+    // Nothing is shown while paused: presenting completes nothing and nothing is pending.
+    h.server.presented(10, &[id]);
+    h.roundtrip();
+    assert!(h.c(c).events::<wl_callback::Event>().is_empty());
+    assert!(!h.server.has_pending_callbacks(&[id]));
+    // Only the latest content is kept for the window.
+    let mut uploads = 0;
+    h.server.upload_pending(|_, _| uploads += 1);
+    assert_eq!(uploads, 1);
+
+    h.server.set_paused(false);
+    assert!(h.server.has_pending_callbacks(&[id]));
+    h.server.presented(20, &[id]);
+    h.roundtrip();
+    assert_eq!(h.c(c).events::<wl_callback::Event>().len(), callbacks.len());
+    assert!(!h.c(c).is_disconnected());
+}
+
+#[test]
+fn windows_opened_and_closed_while_paused_are_reported_in_order() {
+    let mut h = Harness::new();
+    let c = h.connect();
+    let g = globals(h.c(c));
+    let (gone, gone_id) = open_window(&mut h, c, &g, 10, 10, RED);
+    h.server.set_paused(true);
+    let (_new, new_id) = open_window(&mut h, c, &g, 20, 20, RED);
+    gone.toplevel.destroy();
+    gone.xdg.destroy();
+    gone.surface.destroy();
+    h.roundtrip();
+    h.server.set_paused(false);
+    let events = h.server.take_window_events();
+    assert!(
+        events.contains(&WindowEvent::Unmapped { id: gone_id }),
+        "{events:?}"
+    );
+    assert_ne!(gone_id, new_id);
+    assert!(!h.c(c).is_disconnected());
 }

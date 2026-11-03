@@ -19,13 +19,13 @@ use super::{ServerState, xdg_shell};
 use crate::canvas::Point;
 use crate::ffi::shm_map::sealed_memfd;
 use crate::input::{RawModifiers, ScrollSource};
-use crate::shell::{ClientInput, WindowId};
+use crate::shell::{ClientInput, WindowEvent, WindowId};
 
 pub(crate) fn create_global(dh: &DisplayHandle) {
     dh.create_global::<ServerState, WlSeat, ()>(8, ());
 }
 
-/// Default key repeat when the host sent none: 25 keys per second after 600 ms.
+/// Default key repeat (FR-007): 25 keys per second after 600 ms.
 const DEFAULT_REPEAT: (i32, i32) = (25, 600);
 
 /// Input objects of all clients, and where input currently goes.
@@ -43,9 +43,11 @@ pub(crate) struct SeatState {
     keyboard_window: Option<WindowId>,
     pressed_keys: Vec<u32>,
     modifiers: RawModifiers,
-    /// The host keymap in a sealed memfd, and its size.
+    /// The keymap in a sealed memfd, and its size.
     keymap: Option<(File, u32)>,
     repeat: (i32, i32),
+    /// Clients that hid the pointer (`set_cursor` without a surface, FR-008).
+    hidden_cursor: Vec<ClientId>,
 }
 
 impl Default for SeatState {
@@ -62,7 +64,38 @@ impl Default for SeatState {
             modifiers: RawModifiers::default(),
             keymap: None,
             repeat: DEFAULT_REPEAT,
+            hidden_cursor: Vec::new(),
         }
+    }
+}
+
+/// A client hid the pointer or showed it again: tell the shell for each of its windows, once
+/// per change (FR-008).
+fn cursor_hidden(state: &mut ServerState, client: ClientId, hidden: bool) {
+    let before = state.seat.hidden_cursor.contains(&client);
+    if before == hidden {
+        return;
+    }
+    if hidden {
+        state.seat.hidden_cursor.push(client.clone());
+    } else {
+        state.seat.hidden_cursor.retain(|c| *c != client);
+    }
+    let windows: Vec<WindowId> = state
+        .windows
+        .iter()
+        .filter(|(_, root)| {
+            state
+                .surfaces
+                .get(*root)
+                .is_some_and(|s| s.client == client)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    for id in windows {
+        state
+            .window_events
+            .push(WindowEvent::CursorHidden { id, hidden });
     }
 }
 
@@ -137,6 +170,9 @@ fn pointer_leave(state: &mut ServerState) {
         }
     }
     state.seat.buttons_down.clear();
+    // The buttons count as released (a broken grab, or a console switch): an older press no
+    // longer allows a move or resize (FR-016, research S22).
+    state.seat.last_press = None;
 }
 
 fn axis_source(source: ScrollSource) -> wl_pointer::AxisSource {
@@ -195,6 +231,9 @@ pub(crate) fn deliver(state: &mut ServerState, inputs: &[ClientInput], time_ms: 
                 let serial = state.next_serial();
                 if *pressed {
                     state.seat.last_press = Some((*window, serial));
+                } else if state.seat.buttons_down.is_empty() {
+                    // Only a press still held counts for move and resize (FR-016).
+                    state.seat.last_press = None;
                 }
                 let button_state = if *pressed {
                     wl_pointer::ButtonState::Pressed
@@ -333,7 +372,7 @@ fn keyboard_focus(state: &mut ServerState, window: Option<WindowId>) {
     xdg_shell::set_activated(state, window, true);
 }
 
-/// A new keymap from the host: sent to every keyboard and kept for new ones.
+/// A new keymap: sent to every keyboard and kept for new ones.
 pub(crate) fn set_keymap(state: &mut ServerState, text: &str) {
     match sealed_memfd(text) {
         Ok((fd, size)) => {
@@ -347,7 +386,7 @@ pub(crate) fn set_keymap(state: &mut ServerState, text: &str) {
     }
 }
 
-/// New key repeat settings from the host.
+/// New key repeat settings.
 pub(crate) fn set_repeat(state: &mut ServerState, rate: i32, delay: i32) {
     state.seat.repeat = (rate.max(0), delay.max(0));
     for k in state.seat.keyboards.iter().filter(|k| k.is_alive()) {
@@ -458,14 +497,23 @@ impl Dispatch<WlPointer, ()> for ServerState {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
-        // Cursor images are accepted but not shown in this feature (contracts/input.md).
-        if let wl_pointer::Request::SetCursor {
-            surface: Some(surface),
-            ..
-        } = request
-            && !compositor::set_role(state, &surface.id(), Role::Cursor)
-        {
-            pointer.post_error(wl_pointer::Error::Role, "the surface already has a role");
+        // Cursor images are accepted but not shown; a cursor without a surface hides the pointer
+        // over the client's windows (FR-008, contracts/protocols.md "wl_pointer").
+        let wl_pointer::Request::SetCursor { surface, .. } = request else {
+            return;
+        };
+        let Some(client) = pointer.client().map(|c| c.id()) else {
+            return;
+        };
+        match surface {
+            Some(surface) => {
+                if !compositor::set_role(state, &surface.id(), Role::Cursor) {
+                    pointer.post_error(wl_pointer::Error::Role, "the surface already has a role");
+                    return;
+                }
+                cursor_hidden(state, client, false);
+            }
+            None => cursor_hidden(state, client, true),
         }
     }
 

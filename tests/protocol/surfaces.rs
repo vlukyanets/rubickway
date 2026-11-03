@@ -2,6 +2,7 @@
 //! (contracts/protocols.md, research R6, R9, R10, R12).
 
 use rubickway::canvas::{Point, Rect, Size};
+use rubickway::server::Damage;
 use rubickway::shell::{WindowEvent, WindowId};
 use wayland_client::Proxy;
 use wayland_client::protocol::wl_buffer;
@@ -9,13 +10,11 @@ use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_data_device_manager::WlDataDeviceManager;
 use wayland_client::protocol::wl_data_source::{self, WlDataSource};
-use wayland_client::protocol::wl_output::{self, WlOutput};
+use wayland_client::protocol::wl_output;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_shm::WlShm;
 use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
-use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
-use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::shell::client::xdg_popup;
 use wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
@@ -129,7 +128,7 @@ fn globals_and_versions_match_the_contract() {
     let expected = [
         ("wl_compositor", 6),
         ("wl_data_device_manager", 3),
-        ("wl_output", 4),
+        // No `wl_output` without a display (tests/protocol/outputs.rs).
         ("wl_seat", 8),
         ("wl_shm", 1),
         ("wl_subcompositor", 1),
@@ -431,67 +430,6 @@ fn popups_are_dismissed_and_wm_requests_ignored() {
     );
 }
 
-#[test]
-fn output_reports_the_viewer_and_follows_scale_changes() {
-    let mut h = Harness::new();
-    h.server.set_viewer((1600, 1000), 1.25);
-    let c = h.connect();
-    let output: WlOutput = h.c(c).bind(4);
-    h.roundtrip();
-    let events = h.c(c).events::<wl_output::Event>();
-    assert!(
-        events
-            .iter()
-            .any(|(_, e)| matches!(e, wl_output::Event::Name { name } if name == "RUBICKWAY-1"))
-    );
-    assert!(events.iter().any(|(_, e)| matches!(
-        e,
-        wl_output::Event::Mode {
-            width: 1600,
-            height: 1000,
-            ..
-        }
-    )));
-    assert!(
-        events
-            .iter()
-            .any(|(_, e)| matches!(e, wl_output::Event::Scale { factor: 2 }))
-    );
-
-    // A surface with fractional scale hears about changes.
-    let g = globals(h.c(c));
-    let fractional: WpFractionalScaleManagerV1 = h.c(c).bind(1);
-    let (w, _id) = open_window(&mut h, c, &g, 64, 64, RED);
-    let _fs = fractional.get_fractional_scale(&w.surface, &h.c(c).qh, ());
-    h.roundtrip();
-    h.c(c).clear_events();
-    h.server.set_viewer((2000, 1200), 1.5);
-    h.roundtrip();
-    let c_ref = h.c(c);
-    assert!(
-        c_ref
-            .events::<wp_fractional_scale_v1::Event>()
-            .iter()
-            .any(|(_, e)| matches!(
-                e,
-                wp_fractional_scale_v1::Event::PreferredScale { scale: 180 }
-            ))
-    );
-    assert!(
-        c_ref
-            .events::<wl_surface::Event>()
-            .iter()
-            .any(|(_, e)| { matches!(e, wl_surface::Event::PreferredBufferScale { factor: 2 }) })
-    );
-    assert!(
-        c_ref
-            .events::<wl_output::Event>()
-            .iter()
-            .any(|(_, e)| matches!(e, wl_output::Event::Mode { width: 2000, .. }))
-    );
-    let _ = output;
-}
-
 // --- T016: clipboard stub ------------------------------------------------------------------
 
 #[test]
@@ -538,7 +476,10 @@ fn new_content_is_uploaded_for_the_next_frame() {
     let c = h.connect();
     let g = globals(h.c(c));
     let (w, id) = open_window(&mut h, c, &g, 4, 2, RED);
-    h.server.take_dirty();
+    assert!(
+        h.server.take_damage().all,
+        "a new window redraws everything"
+    );
     let mut seen = Vec::new();
     h.server
         .upload_pending(|_, image| seen.push(image.bytes.to_vec()));
@@ -551,7 +492,14 @@ fn new_content_is_uploaded_for_the_next_frame() {
     w.surface.damage_buffer(0, 0, 4, 2);
     w.surface.commit();
     h.roundtrip();
-    assert!(h.server.take_dirty());
+    assert_eq!(
+        h.server.take_damage(),
+        Damage {
+            all: false,
+            windows: vec![id],
+        },
+        "new content redraws only where this window is"
+    );
     let mut seen = Vec::new();
     h.server
         .upload_pending(|_, image| seen.push(image.bytes.to_vec()));
