@@ -11,7 +11,7 @@ publish = false
 calloop = { version = "0.14", features = ["signals"] }
 # Standalone backend (research S1): DRM/KMS, scanout buffers, input, session, device lookup.
 # 0.14, not 0.15: gbm 0.18 is built against drm 0.14, and its buffers must be the same type.
-drm = "0.14"
+drm = "0.15"
 gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 glow = "0.18"
 input = { version = "0.10", default-features = false, features = ["udev", "libinput_1_21"] }
