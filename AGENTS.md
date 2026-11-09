@@ -123,6 +123,12 @@ itself is the point (user-facing copy that needs it, tests for Unicode handling)
   output and assert pixel facts computed from the inputs (`renders_on_llvmpipe` guards the
   renderer). After an intended visual change, update the expected values - colours come from
   the `render` constants - and never commit reference images.
+- **GPU images in tests** need no device: `tests/render_images.rs` makes EGLImages from ordinary GL
+  textures on llvmpipe, and `tests/protocol/dmabuf.rs` uses a pipe as an image that is not finished yet,
+  as polling it says "not readable" until something is written.
+- **Reading a debug log** of a real run: libinput writes to stderr itself, with no timestamp and not in
+  our format, so also search for `libinput error`, not just `WARN`. Its `lagging behind` line means the
+  event loop stood still (Principle VII).
 - **Protocol tests** run the server in-process with `wayland-client` test clients
   (`tests/protocol/harness.rs`); every new global needs its version in the feature's
   `contracts/protocols.md`.

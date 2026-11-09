@@ -213,10 +213,18 @@ extern "C" fn on_sigbus(_signal: c_int, info: *mut libc::siginfo_t, _context: *m
 /// A memfd holding `text` plus a terminating NUL, sealed against shrinking, growing and
 /// writing, and its size in bytes - the form `wl_keyboard.keymap` expects.
 pub fn sealed_memfd(text: &str) -> io::Result<(OwnedFd, u32)> {
+    let mut bytes = Vec::with_capacity(text.len() + 1);
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.push(0);
+    sealed_memfd_bytes(&bytes)
+}
+
+/// A read-only memfd holding `bytes` and its size: safe to share with any number of clients.
+pub fn sealed_memfd_bytes(bytes: &[u8]) -> io::Result<(OwnedFd, u32)> {
     // SAFETY: memfd_create with a static NUL-terminated name; it returns a new fd or -1.
     let raw = unsafe {
         libc::memfd_create(
-            c"rubickway-keymap".as_ptr(),
+            c"rubickway-shared".as_ptr(),
             libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
         )
     };
@@ -225,10 +233,9 @@ pub fn sealed_memfd(text: &str) -> io::Result<(OwnedFd, u32)> {
     }
     // SAFETY: raw is a fresh fd that nothing else owns.
     let mut file = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
-    file.write_all(text.as_bytes())?;
-    file.write_all(&[0])?;
-    let size = u32::try_from(text.len() + 1)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "keymap too large"))?;
+    file.write_all(bytes)?;
+    let size = u32::try_from(bytes.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file too large"))?;
     let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
     // SAFETY: fcntl on our own fd with an integer argument.
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {

@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod canvas;
 pub mod config;
+pub mod distant;
 pub mod ffi;
 pub mod input;
 pub mod render;

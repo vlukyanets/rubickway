@@ -8,8 +8,8 @@ crates and system libraries rather than on Smithay or wlroots. It runs directly 
 hardware (DRM/KMS, libinput, libseat), started from a text console.
 
 Status: runs on the hardware with several monitors; applications open windows on the canvas
-and are moved, resized, maximized and made fullscreen there. Applications draw into shared
-memory only (no GPU buffers yet).
+and are moved, resized, maximized and made fullscreen there. Applications draw on the GPU
+driving the displays, or into shared memory.
 
 ## Prerequisites
 
@@ -64,8 +64,10 @@ prints the socket name:
 INFO rubickway: applications can connect with WAYLAND_DISPLAY=wayland-1
 ```
 
-GPU applications such as kitty work too: with no GPU-buffer protocol offered, Mesa draws them
-with its software renderer by itself.
+Applications find the GPU driving the displays by themselves and draw on it. A program started
+on another GPU, for example with `prime-run`, shows its window as well. If that GPU cannot hand
+its images to RubickWay, the log says so and applications draw in software through shared memory.
+Choosing which GPU RubickWay composes on is not there yet.
 
 ## Configuration
 
@@ -115,7 +117,24 @@ binds {
 }
 ```
 
-The full reference is in `specs/20261102-143401-drm-backend/contracts/config.md`.
+Less work for distant windows is off unless configured, and each part is optional:
+
+```kdl
+distant-windows {
+    // At this canvas zoom or below (1-100), a window counts as distant. Nothing else
+    // here does anything without it.
+    below-zoom-percent 50
+    // Ask distant windows for at most this many frames a second (1-240).
+    max-fps 15
+    // Smooth them with a copy of this size, as a percentage of the size they are drawn at
+    // (25-400), instead of one as large as the window. Lighter, a little less sharp, and it
+    // may shimmer on fine detail.
+    copy-detail-percent 100
+}
+```
+
+The full reference is in `specs/20261102-143401-drm-backend/contracts/config.md` and
+`specs/20261104-004828-gpu-buffers/contracts/config.md`.
 
 ## Controls
 

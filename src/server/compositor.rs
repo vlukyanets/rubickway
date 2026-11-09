@@ -2,7 +2,10 @@
 //! surface tree (research R6). References: Smithay `wayland/compositor`, wlroots
 //! `wlr_compositor.c`.
 
+use std::collections::HashMap;
+
 use wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1::WpFractionalScaleV1;
+use wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1;
 use wayland_protocols::wp::viewporter::server::wp_viewport::{self, WpViewport};
 use wayland_server::backend::{ClientId, ObjectId};
 use wayland_server::protocol::wl_buffer::WlBuffer;
@@ -13,6 +16,11 @@ use wayland_server::protocol::wl_region::{self, WlRegion};
 use wayland_server::protocol::wl_surface::{self, WlSurface};
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
+use super::commit_queue::WaitId;
+use super::descriptors;
+use super::dmabuf::{BufferKey, GpuBuffer, ImportState, ShownImage, Wait};
+use super::shm::BufferKind;
+use super::syncobj::{self, SyncPoint, ToRelease};
 use super::{ServerState, SurfaceKey, SurfacePart, seat, shm, xdg_shell};
 use crate::canvas::{Point, Rect, Size, Vector};
 pub use crate::render::Transform;
@@ -51,6 +59,9 @@ pub(crate) struct SurfaceState {
     pub viewport_src: Option<Rect>,
     pub viewport_dst: Option<(i32, i32)>,
     pub callbacks: Vec<WlCallback>,
+    /// Pending only, like `attach`: the points of the buffer attached.
+    pub acquire: Option<SyncPoint>,
+    pub release: Option<SyncPoint>,
 }
 
 impl Default for SurfaceState {
@@ -63,6 +74,8 @@ impl Default for SurfaceState {
             viewport_src: None,
             viewport_dst: None,
             callbacks: Vec::new(),
+            acquire: None,
+            release: None,
         }
     }
 }
@@ -96,6 +109,12 @@ pub(crate) struct Surface {
     pub buffer_size: Option<(i32, i32)>,
     /// A committed buffer not copied yet.
     pub upload: Option<WlBuffer>,
+    /// The GPU image shown: it stays the application's until replaced (research G9).
+    pub image: Option<WlBuffer>,
+    /// How that image goes back, when it came with explicit synchronisation.
+    pub image_release: Option<SyncPoint>,
+    /// The surface's `wp_linux_drm_syncobj_surface_v1`.
+    pub syncobj: Option<WpLinuxDrmSyncobjSurfaceV1>,
     pub has_content: bool,
     pub role: Role,
     pub parent: Option<ObjectId>,
@@ -180,6 +199,9 @@ impl Dispatch<WlCompositor, ()> for ServerState {
                         cached: None,
                         buffer_size: None,
                         upload: None,
+                        image: None,
+                        image_release: None,
+                        syncobj: None,
                         has_content: false,
                         role: Role::None,
                         parent: None,
@@ -337,11 +359,16 @@ impl Dispatch<WlSurface, ()> for ServerState {
 
 /// Applies a commit (or caches it for a synchronised subsurface).
 pub(crate) fn commit(state: &mut ServerState, id: &ObjectId) {
+    if !syncobj::check_commit(state, id) {
+        return;
+    }
     let Some(surface) = state.surfaces.get_mut(id) else {
         return;
     };
     let mut committed = surface.pending.clone();
     surface.pending.attach = None;
+    surface.pending.acquire = None;
+    surface.pending.release = None;
     surface.pending.callbacks.clear();
     if surface.role == Role::Subsurface && effectively_sync(state, id) {
         let Some(surface) = state.surfaces.get_mut(id) else {
@@ -351,9 +378,17 @@ pub(crate) fn commit(state: &mut ServerState, id: &ObjectId) {
             Some(mut cached) => {
                 if committed.attach.is_some() {
                     cached.attach = committed.attach.take();
+                    // The image it replaces will never be read: it goes back now.
+                    if let Some(never_read) = cached.release.take() {
+                        never_read.signal();
+                    }
+                    cached.acquire = committed.acquire.take();
+                    cached.release = committed.release.take();
                 }
                 cached.callbacks.append(&mut committed.callbacks);
                 committed.attach = cached.attach;
+                committed.acquire = cached.acquire;
+                committed.release = cached.release;
                 committed.callbacks = cached.callbacks;
                 surface.cached = Some(committed);
             }
@@ -361,12 +396,187 @@ pub(crate) fn commit(state: &mut ServerState, id: &ObjectId) {
         }
         return;
     }
-    if !apply(state, id, committed) {
-        return;
+    enqueue(state, id, committed);
+}
+
+/// One surface's share of a transaction.
+pub(crate) struct Part {
+    surface: ObjectId,
+    /// The committed state to make current; `None` for a child that only moves.
+    state: Option<SurfaceState>,
+    /// It attaches a GPU image: if the application destroys that while the commit waits, the
+    /// window keeps its picture (misbehaving case 9).
+    attaches_image: bool,
+    /// The stacking order that takes effect with it.
+    stack: Option<Vec<StackEntry>>,
+    /// The position that takes effect with it (subsurfaces).
+    position: Option<(i32, i32)>,
+}
+
+/// One commit: the commit root's state and the cached state of its synchronised descendants, all
+/// taking effect together (research G7).
+pub(crate) struct Transaction {
+    /// The commit root.
+    root: ObjectId,
+    parts: Vec<Part>,
+    /// The toplevel's or popup's geometry and limits at the commit, if the root is one.
+    xdg: Option<xdg_shell::XdgCapture>,
+}
+
+/// Makes a transaction of a commit on `id` and queues it; it applies at once if it has nothing
+/// to wait for and nothing is ahead of it.
+fn enqueue(state: &mut ServerState, id: &ObjectId, committed: SurfaceState) {
+    let mut parts = vec![Part {
+        surface: id.clone(),
+        attaches_image: attached_image(state, &committed).is_some(),
+        state: Some(committed),
+        stack: state.surfaces.get(id).map(|s| s.pending_stack.clone()),
+        position: None,
+    }];
+    gather_children(state, id, &mut parts);
+    let mut waits: Vec<WaitId> = Vec::new();
+    let mut files = Vec::new();
+    let mut failures = Vec::new();
+    for committed in parts.iter().filter_map(|p| p.state.as_ref()) {
+        if let Some(image) = attached_image(state, committed) {
+            match image.state {
+                ImportState::Pending(wait) => waits.push(wait),
+                ImportState::Ready => {}
+                // Never read, so nothing to wait for.
+                ImportState::Failed => continue,
+            }
+            // With an acquire point implicit synchronisation is ignored (contracts/protocols.md).
+            let unfinished = match &committed.acquire {
+                Some(acquire) => vec![acquire.unfinished()],
+                None => image
+                    .unfinished_planes()
+                    .into_iter()
+                    .map(|plane| plane.map(Some))
+                    .collect(),
+            };
+            for file in unfinished {
+                match file {
+                    Ok(file) => files.extend(file),
+                    Err(err) => failures.push(err),
+                }
+            }
+        }
     }
-    apply_children(state, id);
-    let root = root_of(state, id);
-    xdg_shell::tree_committed(state, &root, id);
+    for err in failures {
+        // A window must not stop for good for this, so the image is shown as it is.
+        if !descriptors::note_failure(state, &err) {
+            tracing::warn!("cannot wait for an image to be finished ({err}): showing it as it is");
+        }
+    }
+    if !files.is_empty() {
+        tracing::debug!("an image is not finished yet: its commit waits");
+    }
+    for fd in files {
+        let wait = state.new_wait();
+        state.waits.push(Wait { id: wait, fd });
+        waits.push(wait);
+    }
+    let transaction = Transaction {
+        root: id.clone(),
+        parts,
+        xdg: xdg_shell::capture(state, id),
+    };
+    let ready = state
+        .queues
+        .entry(id.clone())
+        .or_default()
+        .push(transaction, waits);
+    apply_ready(state, id, ready);
+}
+
+/// The GPU image a committed state attaches, if it does.
+fn attached_image<'a>(state: &'a ServerState, committed: &SurfaceState) -> Option<&'a GpuBuffer> {
+    let buffer = committed.attach.as_ref()?.as_ref()?;
+    match state.buffers.get(&buffer.id())? {
+        BufferKind::Gpu(gpu) => Some(gpu),
+        BufferKind::Shm(_) => None,
+    }
+}
+
+/// Something a transaction waited for is finished: whatever can apply now, applies.
+pub(crate) fn wait_done(state: &mut ServerState, wait: WaitId) {
+    let roots: Vec<ObjectId> = state.queues.keys().cloned().collect();
+    for root in roots {
+        let Some(queue) = state.queues.get_mut(&root) else {
+            continue;
+        };
+        let ready = queue.done(wait);
+        apply_ready(state, &root, ready);
+    }
+}
+
+/// Applies what a queue returned, and forgets the queue once it is empty.
+fn apply_ready(state: &mut ServerState, root: &ObjectId, ready: Vec<Transaction>) {
+    for transaction in ready {
+        apply_transaction(state, transaction);
+    }
+    if state.queues.get(root).is_some_and(|q| q.is_empty()) {
+        state.queues.remove(root);
+    }
+}
+
+/// Adds to `parts` what the children of `id` take from their parent's commit: their position,
+/// and the cached state of synchronised ones, with theirs in turn.
+fn gather_children(state: &mut ServerState, id: &ObjectId, parts: &mut Vec<Part>) {
+    let children: Vec<ObjectId> = state.surfaces.get(id).map_or_else(Vec::new, |s| {
+        s.pending_stack
+            .iter()
+            .filter_map(|e| match e {
+                StackEntry::Child(c) => Some(c.clone()),
+                StackEntry::Own => None,
+            })
+            .collect()
+    });
+    for child in children {
+        let Some(c) = state.surfaces.get_mut(&child) else {
+            continue;
+        };
+        let cached = c.cached.take();
+        let has_cached = cached.is_some();
+        let stack = has_cached.then(|| c.pending_stack.clone());
+        let position = Some(c.pending_position);
+        parts.push(Part {
+            surface: child.clone(),
+            attaches_image: cached
+                .as_ref()
+                .is_some_and(|s| attached_image(state, s).is_some()),
+            stack,
+            position,
+            state: cached,
+        });
+        if has_cached {
+            gather_children(state, &child, parts);
+        }
+    }
+}
+
+/// Makes a transaction current. Stops at a protocol violation: that client is gone.
+fn apply_transaction(state: &mut ServerState, transaction: Transaction) {
+    for part in transaction.parts {
+        let Some(surface) = state.surfaces.get_mut(&part.surface) else {
+            continue;
+        };
+        if let Some(position) = part.position {
+            surface.position = position;
+        }
+        if let Some(committed) = part.state
+            && !apply(state, &part.surface, committed, part.attaches_image)
+        {
+            return;
+        }
+        if let Some(stack) = part.stack
+            && let Some(surface) = state.surfaces.get_mut(&part.surface)
+        {
+            surface.stack = stack;
+        }
+    }
+    let tree_root = root_of(state, &transaction.root);
+    xdg_shell::tree_committed(state, &tree_root, &transaction.root, transaction.xdg);
 }
 
 /// Whether a subsurface (or one of its ancestors) is in synchronised mode.
@@ -395,47 +605,41 @@ pub(crate) fn apply_cached_if_desync(state: &mut ServerState, id: &ObjectId) {
     let Some(cached) = state.surfaces.get_mut(id).and_then(|s| s.cached.take()) else {
         return;
     };
-    if apply(state, id, cached) {
-        apply_children(state, id);
-        let root = root_of(state, id);
-        xdg_shell::tree_committed(state, &root, id);
-    }
-}
-
-/// On a parent's commit: placement order, positions and cached child state take effect.
-fn apply_children(state: &mut ServerState, id: &ObjectId) {
-    let Some(surface) = state.surfaces.get_mut(id) else {
-        return;
-    };
-    surface.stack = surface.pending_stack.clone();
-    let children: Vec<ObjectId> = surface
-        .stack
-        .iter()
-        .filter_map(|e| match e {
-            StackEntry::Child(c) => Some(c.clone()),
-            StackEntry::Own => None,
-        })
-        .collect();
-    for child in children {
-        let Some(c) = state.surfaces.get_mut(&child) else {
-            continue;
-        };
-        c.position = c.pending_position;
-        if let Some(cached) = c.cached.take()
-            && apply(state, &child, cached)
-        {
-            apply_children(state, &child);
-        }
-    }
+    enqueue(state, id, cached);
 }
 
 /// Makes `committed` the current state of surface `id`. Returns false if the client was
-/// disconnected for a protocol violation.
-fn apply(state: &mut ServerState, id: &ObjectId, committed: SurfaceState) -> bool {
+/// disconnected for a protocol violation. A GPU image that failed, or was destroyed since the
+/// commit (`attaches_image`), changes nothing: the window keeps its picture, the frame callbacks
+/// complete, and the buffer goes back (research G8).
+fn apply(
+    state: &mut ServerState,
+    id: &ObjectId,
+    committed: SurfaceState,
+    attaches_image: bool,
+) -> bool {
     let attach = committed.attach.clone();
+    if let Some(Some(buffer)) = &attach {
+        let unusable = match state.buffers.get(&buffer.id()) {
+            Some(BufferKind::Gpu(gpu)) => gpu.state == ImportState::Failed,
+            Some(BufferKind::Shm(_)) => false,
+            None => attaches_image,
+        };
+        if unusable {
+            let mut committed = committed;
+            if let Some(surface) = state.surfaces.get_mut(id) {
+                surface.frame_callbacks.append(&mut committed.callbacks);
+            }
+            match &committed.release {
+                Some(point) => point.signal(),
+                None => shm::release(buffer),
+            }
+            return true;
+        }
+    }
     let new_size = match &attach {
         Some(Some(buffer)) => match state.buffers.get(&buffer.id()) {
-            Some(b) => Some(Some((b.width, b.height))),
+            Some(b) => Some(Some(b.size())),
             None => Some(None),
         },
         Some(None) => Some(None),
@@ -485,26 +689,77 @@ fn apply(state: &mut ServerState, id: &ObjectId, committed: SurfaceState) -> boo
     }
     let mut committed = committed;
     surface.frame_callbacks.append(&mut committed.callbacks);
-    if let Some(buffer) = attach {
+    let client = surface.client.clone();
+    let mut old_release = None;
+    let replaced = if let Some(buffer) = attach {
         if let Some(old) = surface.upload.take() {
             shm::release(&old);
         }
+        let old_image = surface.image.take();
+        old_release = surface.image_release.take();
         match buffer {
             Some(buffer) => {
-                surface.upload = Some(buffer);
                 surface.buffer_size = size;
+                match image_of(&state.buffers, &buffer) {
+                    Some((image, y_invert)) => {
+                        surface.has_content = true;
+                        state.shown_images.push(ShownImage {
+                            surface: surface.key,
+                            image,
+                            y_invert,
+                        });
+                        surface.image = Some(buffer);
+                        surface.image_release = committed.release.take();
+                    }
+                    None => surface.upload = Some(buffer),
+                }
             }
             None => {
                 surface.buffer_size = None;
                 surface.has_content = false;
             }
         }
-    }
+        old_image
+    } else {
+        None
+    };
+    let now_shown = surface.image.clone();
     committed.attach = None;
+    committed.acquire = None;
+    committed.release = None;
     surface.current = committed;
+    if let Some(shown) = &now_shown {
+        // Attached again before it went back: it is in use again.
+        state.release.retain(|entry| !entry.is_buffer(shown));
+    }
+    if let Some(point) = old_release {
+        // Each commit's point is signalled, also when the same image is attached again.
+        state
+            .release
+            .retire(ToRelease::Point(point, client), state.frame_seq);
+    } else if let Some(old) = replaced
+        && now_shown
+            .as_ref()
+            .is_none_or(|shown| shown.id() != old.id())
+    {
+        state
+            .release
+            .retire(ToRelease::Buffer(old), state.frame_seq);
+    }
     // Only the displays showing this surface's window need a new frame (research S7).
     state.damaged.push(id.clone());
     true
+}
+
+/// The image and orientation of a `wl_buffer` that is a GPU image.
+fn image_of(
+    buffers: &HashMap<ObjectId, BufferKind>,
+    buffer: &WlBuffer,
+) -> Option<(BufferKey, bool)> {
+    match buffers.get(&buffer.id())? {
+        BufferKind::Gpu(gpu) => Some((gpu.key, gpu.y_invert)),
+        BufferKind::Shm(_) => None,
+    }
 }
 
 /// The root of the surface tree containing `id`.
@@ -724,11 +979,29 @@ pub(crate) fn announce_scale(state: &ServerState, id: &ObjectId) {
 fn surface_destroyed(state: &mut ServerState, id: &ObjectId) {
     xdg_shell::surface_destroyed(state, id);
     seat::surface_destroyed(state, id);
+    if let Some(queue) = state.queues.remove(id) {
+        state.cancelled_waits.extend(queue.waits());
+    }
+    for queue in state.queues.values_mut() {
+        queue.retain_mut(|transaction| {
+            transaction.parts.retain(|part| part.surface != *id);
+            true
+        });
+    }
     let Some(surface) = state.surfaces.remove(id) else {
         return;
     };
     if let Some(old) = surface.upload {
         shm::release(&old);
+    }
+    match (surface.image_release, surface.image) {
+        (Some(point), _) => state
+            .release
+            .retire(ToRelease::Point(point, surface.client), state.frame_seq),
+        (None, Some(old)) => state
+            .release
+            .retire(ToRelease::Buffer(old), state.frame_seq),
+        (None, None) => {}
     }
     state.destroyed.push(surface.key);
     if let Some(parent) = &surface.parent

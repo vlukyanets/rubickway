@@ -1,6 +1,7 @@
 //! Which graphics card to use (research S4): the one the firmware used at boot, else the first
 //! with display connectors. Only `seat0` cards are considered.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::DrmError;
@@ -60,6 +61,32 @@ fn scan() -> std::io::Result<Vec<Candidate>> {
     Ok(found)
 }
 
+/// The render node of a card and its device number, for telling applications which GPU to use
+/// (research G2). Found through sysfs, so no device is opened or woken (FR-012).
+pub(crate) fn render_node_of(card: &Path) -> std::io::Result<(PathBuf, u64)> {
+    let name = card
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("the card has no name"))?;
+    let dir = Path::new("/sys/class/drm").join(name).join("device/drm");
+    let names: Vec<String> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let node = render_node_name(&names)
+        .map(|n| Path::new("/dev/dri").join(n))
+        .ok_or_else(|| std::io::Error::other("the card has no render node"))?;
+    let device = std::fs::metadata(&node)?.rdev();
+    Ok((node, device))
+}
+
+/// The render node among the entries of a card's `device/drm` directory.
+fn render_node_name(names: &[String]) -> Option<&str> {
+    names
+        .iter()
+        .map(String::as_str)
+        .find(|n| n.starts_with("renderD"))
+}
+
 /// Whether `/sys/.../cardN` has connector entries `cardN-*`.
 fn has_connectors(syspath: &Path, name: &str) -> bool {
     let prefix = format!("{name}-");
@@ -94,12 +121,20 @@ mod tests {
 
     #[test]
     fn the_boot_gpu_with_connectors_wins() {
-        // The author's laptop: NVIDIA card1 without connectors, Intel card2 booted with them.
+        // The author's laptop: NVIDIA without connectors, Intel booted with them. Which of them
+        // is card0, card1 or card2 varies between boots, so nothing may rely on the numbers.
         let found = [
             c("/dev/dri/card1", false, false),
             c("/dev/dri/card2", true, true),
         ];
         assert_eq!(pick(&found), Some(PathBuf::from("/dev/dri/card2")));
+    }
+
+    #[test]
+    fn the_render_node_is_found_among_a_cards_entries() {
+        let names = ["card1".to_string(), "renderD128".to_string()];
+        assert_eq!(render_node_name(&names), Some("renderD128"));
+        assert_eq!(render_node_name(&names[..1]), None);
     }
 
     #[test]

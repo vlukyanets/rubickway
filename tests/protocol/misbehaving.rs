@@ -2,18 +2,27 @@
 //! that only the offending client is disconnected and that a well-behaved client still gets
 //! its frame callback afterwards.
 
+use std::fs::File;
 use std::os::fd::AsFd;
 
 use rubickway::canvas::Size;
-use rubickway::shell::{States, WindowCommand, WindowEvent, WindowId};
+use rubickway::shell::{ClientInput, States, WindowCommand, WindowEvent, WindowId};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
+use wayland_client::protocol::wl_keyboard;
+use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_surface;
 use wayland_client::{Connection, Proxy};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{
+    self, Flags, ZwpLinuxBufferParamsV1,
+};
 use wayland_protocols::xdg::shell::client::xdg_toplevel;
 
+use crate::commits::unfinished;
+use crate::dmabuf::{ARGB, dmabuf, gpu_harness, immed, imports_succeed};
 use crate::harness::{Harness, solid_buffer, temp_file};
 use crate::surfaces::{Window, globals, open_window};
+use crate::syncobj::{Sync, sync_client, sync_harness};
 
 const RED: u32 = 0xffff_0000;
 
@@ -237,6 +246,441 @@ fn case_6_a_client_that_never_draws_shows_nothing() {
     h.roundtrip();
     assert!(h.server.take_window_events().is_empty());
     assert!(!h.c(ci).is_disconnected());
+    assert_good_client_works(&mut h, &good);
+}
+
+// GPU images (gpu-buffers spec, Edge Cases 1-6 and 9-11; each row of the contract is also tested
+// in `dmabuf.rs`). Each leaves RubickWay and another client running.
+
+/// A misuse of one description: what a client sends on new parameters, given a 64-byte file.
+type Misuse = fn(&ZwpLinuxBufferParamsV1, &File);
+
+const LINEAR_HI: u32 = 0;
+const LINEAR_LO: u32 = 0;
+
+fn add_plane(p: &ZwpLinuxBufferParamsV1, file: &File, plane: u32) {
+    p.add(file.as_fd(), plane, 0, 16, LINEAR_HI, LINEAR_LO);
+}
+
+/// Runs each misuse on a new client of one server, next to a good client.
+fn each_misuse(cases: &[(&str, Misuse)], check: impl Fn(&mut Harness, usize, &str)) {
+    let mut h = gpu_harness();
+    let good = good_client(&mut h);
+    for (what, misuse) in cases {
+        let ci = h.connect();
+        let d = dmabuf(&mut h, ci, 5);
+        let p = d.create_params(&h.c(ci).qh, ());
+        let file = temp_file(64);
+        misuse(&p, &file);
+        h.roundtrip();
+        check(&mut h, ci, what);
+        assert_good_client_works(&mut h, &good);
+    }
+}
+
+fn ended(h: &mut Harness, ci: usize, what: &str) {
+    assert!(h.c(ci).is_disconnected(), "{what}");
+}
+
+/// Whether the client was told `failed` and stays connected.
+fn only_the_image_failed(h: &mut Harness, ci: usize, what: &str) {
+    let c = h.c(ci);
+    assert!(!c.is_disconnected(), "{what}: {:?}", c.error());
+    let failed = c
+        .events::<zwp_linux_buffer_params_v1::Event>()
+        .iter()
+        .any(|(_, e)| matches!(e, zwp_linux_buffer_params_v1::Event::Failed));
+    assert!(failed, "{what}");
+}
+
+#[test]
+fn gpu_case_1_invalid_descriptions_end_only_that_client() {
+    each_misuse(
+        &[
+            ("zero size", |p, f| {
+                add_plane(p, f, 0);
+                p.create(0, 4, ARGB, Flags::empty());
+            }),
+            ("negative size", |p, f| {
+                add_plane(p, f, 0);
+                p.create(4, -1, ARGB, Flags::empty());
+            }),
+            ("plane out of range", |p, f| add_plane(p, f, 4)),
+            ("the same plane twice", |p, f| {
+                add_plane(p, f, 0);
+                add_plane(p, f, 0);
+            }),
+            ("no plane", |p, _| p.create(4, 4, ARGB, Flags::empty())),
+            ("a plane missing in between", |p, f| {
+                add_plane(p, f, 1);
+                p.create(4, 4, ARGB, Flags::empty());
+            }),
+            ("arithmetic that overflows", |p, f| {
+                p.add(f.as_fd(), 0, u32::MAX, u32::MAX, LINEAR_HI, LINEAR_LO);
+                p.create(i32::MAX, i32::MAX, ARGB, Flags::empty());
+            }),
+        ],
+        ended,
+    );
+}
+
+#[test]
+fn gpu_case_2_a_description_used_twice_or_changed_after_use_ends_only_that_client() {
+    each_misuse(
+        &[
+            ("used twice", |p, f| {
+                add_plane(p, f, 0);
+                p.create(4, 4, ARGB, Flags::empty());
+                p.create(4, 4, ARGB, Flags::empty());
+            }),
+            ("changed after use", |p, f| {
+                add_plane(p, f, 0);
+                p.create(4, 4, ARGB, Flags::empty());
+                add_plane(p, f, 1);
+            }),
+        ],
+        ended,
+    );
+}
+
+#[test]
+fn gpu_case_3_a_file_that_is_not_an_image_fails_only_that_image() {
+    // The real check of files, not the double accepting any.
+    let mut h = Harness::new();
+    h.server.set_gpu_offer(1, vec![(ARGB, 0)]).expect("offer");
+    let good = good_client(&mut h);
+    let ci = h.connect();
+    let d = dmabuf(&mut h, ci, 5);
+    let p = d.create_params(&h.c(ci).qh, ());
+    let file = temp_file(64);
+    add_plane(&p, &file, 0);
+    p.create(4, 4, ARGB, Flags::empty());
+    h.roundtrip();
+    only_the_image_failed(&mut h, ci, "an ordinary file");
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn gpu_case_3_a_file_too_small_for_its_layout_ends_only_that_client() {
+    each_misuse(
+        &[("a file of 64 bytes for 4 x 8", |p, f| {
+            add_plane(p, f, 0);
+            p.create(4, 8, ARGB, Flags::empty());
+        })],
+        ended,
+    );
+}
+
+#[test]
+fn gpu_case_4_what_was_not_offered_ends_only_that_client() {
+    each_misuse(
+        &[
+            ("a format never offered", |p, f| {
+                add_plane(p, f, 0);
+                p.create(4, 4, 0x2020_2020, Flags::empty());
+            }),
+            ("a modifier never offered", |p, f| {
+                p.add(f.as_fd(), 0, 0, 16, 0x0100_0000, 1);
+                p.create(4, 4, ARGB, Flags::empty());
+            }),
+            ("different modifiers across planes", |p, f| {
+                add_plane(p, f, 0);
+                p.add(f.as_fd(), 1, 0, 16, 0x0100_0000, 1);
+            }),
+        ],
+        ended,
+    );
+}
+
+#[test]
+fn gpu_case_4_unsupported_flags_fail_only_that_image() {
+    // More planes than the driver accepts fail the same way, in the import: see case 5 here and
+    // the quickstart for a real driver.
+    each_misuse(
+        &[("interlaced", |p, f| {
+            add_plane(p, f, 0);
+            p.create(4, 4, ARGB, Flags::Interlaced);
+        })],
+        only_the_image_failed,
+    );
+}
+
+#[test]
+fn gpu_case_5_a_refused_import_fails_only_that_image() {
+    let mut h = gpu_harness();
+    let good = good_client(&mut h);
+    let ci = h.connect();
+    let d = dmabuf(&mut h, ci, 5);
+    let _b = immed(&mut h, ci, &d, 4, 4);
+    h.roundtrip();
+    h.server.process_imports(|_| Err("refused".to_string()));
+    h.roundtrip();
+    only_the_image_failed(&mut h, ci, "refused by the GPU");
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn gpu_case_6_an_image_above_the_limit_ends_only_that_client() {
+    let mut h = gpu_harness();
+    h.server.set_max_texture_side(32);
+    let good = good_client(&mut h);
+    let ci = h.connect();
+    let g = globals(h.c(ci));
+    let d = dmabuf(&mut h, ci, 5);
+    let w = crate::surfaces::create_window(&mut h, ci, &g);
+    crate::surfaces::ack(&mut h, ci, &w);
+    let b = immed(&mut h, ci, &d, 33, 4);
+    w.surface.attach(Some(&b), 0, 0);
+    w.surface.commit();
+    h.roundtrip();
+    imports_succeed(&mut h);
+    assert!(h.c(ci).is_disconnected());
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn gpu_case_7_an_image_never_finished_stops_only_its_own_window() {
+    let mut h = gpu_harness();
+    let good = good_client(&mut h);
+    let seat: WlSeat = h.c(good.index).bind(8);
+    let _keyboard = seat.get_keyboard(&h.c(good.index).qh, ());
+    h.roundtrip();
+
+    let ci = h.connect();
+    let g = globals(h.c(ci));
+    let d = dmabuf(&mut h, ci, 5);
+    let w = crate::surfaces::create_window(&mut h, ci, &g);
+    crate::surfaces::ack(&mut h, ci, &w);
+    let never = unfinished(&mut h, ci, &d, 20, 10);
+    w.surface.attach(Some(&never.buffer), 0, 0);
+    w.surface.commit();
+    h.roundtrip();
+    imports_succeed(&mut h);
+    let waits = h.server.take_waits();
+    assert_eq!(
+        waits.len(),
+        1,
+        "it is left to the event loop: nothing blocks"
+    );
+
+    // Later commits wait behind it, however many.
+    let later = immed(&mut h, ci, &d, 8, 8);
+    for _ in 0..3 {
+        w.surface.attach(Some(&later), 0, 0);
+        w.surface.commit();
+    }
+    h.roundtrip();
+    imports_succeed(&mut h);
+    assert!(
+        !h.server
+            .take_window_events()
+            .iter()
+            .any(|e| matches!(e, WindowEvent::Mapped { id, .. } if *id != good.id)),
+        "its window waits for its image"
+    );
+
+    // The other client keeps getting frames and input.
+    assert_good_client_works(&mut h, &good);
+    h.c(good.index).clear_events();
+    h.server
+        .deliver(&[ClientInput::KeyboardFocus(Some(good.id))], 5);
+    h.roundtrip();
+    assert!(
+        h.c(good.index)
+            .events::<wl_keyboard::Event>()
+            .iter()
+            .any(|(_, e)| matches!(e, wl_keyboard::Event::Enter { .. }))
+    );
+    assert!(!h.c(ci).is_disconnected());
+}
+
+#[test]
+fn gpu_case_8_no_limit_ends_a_client_creating_many_objects() {
+    // Their number is not limited, as in other compositors (spec Assumptions).
+    let (mut h, _fake) = sync_harness();
+    let good = good_client(&mut h);
+    let ci = h.connect();
+    let s = sync_client(&mut h, ci);
+    let qh = h.c(ci).qh.clone();
+    let file = temp_file(64);
+    for _ in 0..300 {
+        let _params = s.dmabuf.create_params(&qh, ());
+        let _timeline = s.manager.import_timeline(file.as_fd(), &qh, ());
+    }
+    h.roundtrip();
+    // Fewer than the objects above: each holds files of the test process too.
+    for i in 0..100 {
+        let image = immed(&mut h, ci, &s.dmabuf, 4, 4);
+        s.surface.set_acquire_point(&s.a, 0, i + 1);
+        s.surface.set_release_point(&s.b, 0, i + 1);
+        s.window.surface.attach(Some(&image), 0, 0);
+        s.window.surface.commit();
+    }
+    h.roundtrip();
+    imports_succeed(&mut h);
+    assert_eq!(h.server.take_waits().len(), 100, "all of them wait");
+    assert!(!h.c(ci).is_disconnected());
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn gpu_case_12_misusing_explicit_synchronisation_ends_only_that_client() {
+    type SyncMisuse = fn(&mut Harness, usize, &Sync);
+    let cases: [(&str, SyncMisuse); 8] = [
+        ("a second object for a surface", |h, ci, s| {
+            let qh = h.c(ci).qh.clone();
+            let _again = s.manager.get_surface(&s.window.surface, &qh, ());
+        }),
+        ("a file that is not a timeline", |h, ci, s| {
+            let qh = h.c(ci).qh.clone();
+            let file = temp_file(0);
+            let _t = s.manager.import_timeline(file.as_fd(), &qh, ());
+        }),
+        ("points with no image", |_, _, s| {
+            s.surface.set_acquire_point(&s.a, 0, 1);
+            s.surface.set_release_point(&s.b, 0, 1);
+            s.window.surface.commit();
+        }),
+        ("an image with no acquire point", |h, ci, s| {
+            let b = immed(h, ci, &s.dmabuf, 4, 4);
+            s.surface.set_release_point(&s.b, 0, 1);
+            s.window.surface.attach(Some(&b), 0, 0);
+            s.window.surface.commit();
+        }),
+        ("an image with no release point", |h, ci, s| {
+            let b = immed(h, ci, &s.dmabuf, 4, 4);
+            s.surface.set_acquire_point(&s.a, 0, 1);
+            s.window.surface.attach(Some(&b), 0, 0);
+            s.window.surface.commit();
+        }),
+        ("an image with no points", |h, ci, s| {
+            let b = immed(h, ci, &s.dmabuf, 4, 4);
+            s.window.surface.attach(Some(&b), 0, 0);
+            s.window.surface.commit();
+        }),
+        ("the same point for ready and finished", |h, ci, s| {
+            let b = immed(h, ci, &s.dmabuf, 4, 4);
+            s.surface.set_acquire_point(&s.a, 0, 5);
+            s.surface.set_release_point(&s.a, 0, 5);
+            s.window.surface.attach(Some(&b), 0, 0);
+            s.window.surface.commit();
+        }),
+        ("shared memory with points", |h, ci, s| {
+            let g = globals(h.c(ci));
+            let (b, _pool, _file) = solid_buffer(h.c(ci), &g.shm, 4, 4, RED);
+            s.surface.set_acquire_point(&s.a, 0, 1);
+            s.surface.set_release_point(&s.b, 0, 1);
+            s.window.surface.attach(Some(&b), 0, 0);
+            s.window.surface.commit();
+        }),
+    ];
+    let (mut h, _fake) = sync_harness();
+    let good = good_client(&mut h);
+    for (what, misuse) in cases {
+        let ci = h.connect();
+        let s = sync_client(&mut h, ci);
+        misuse(&mut h, ci, &s);
+        h.roundtrip();
+        assert!(h.c(ci).is_disconnected(), "{what}");
+        assert_good_client_works(&mut h, &good);
+    }
+}
+
+#[test]
+fn gpu_case_9_destroying_an_image_while_shown_or_waiting_keeps_the_picture() {
+    let mut h = gpu_harness();
+    let good = good_client(&mut h);
+    let ci = h.connect();
+    let g = globals(h.c(ci));
+    let d = dmabuf(&mut h, ci, 5);
+    let w = crate::surfaces::create_window(&mut h, ci, &g);
+    crate::surfaces::ack(&mut h, ci, &w);
+    let shown = immed(&mut h, ci, &d, 20, 10);
+    w.surface.attach(Some(&shown), 0, 0);
+    w.surface.commit();
+    h.roundtrip();
+    imports_succeed(&mut h);
+    let id = h
+        .server
+        .take_window_events()
+        .into_iter()
+        .find_map(|e| match e {
+            WindowEvent::Mapped { id, .. } => Some(id),
+            _ => None,
+        })
+        .expect("mapped");
+    let parts = h.server.window_parts(id);
+    assert!(parts[0].has_content);
+
+    // Destroyed while shown.
+    shown.destroy();
+    h.roundtrip();
+    assert_eq!(h.server.window_parts(id), parts);
+
+    // Destroyed while its commit waits for the import.
+    let waiting = immed(&mut h, ci, &d, 8, 8);
+    w.surface.attach(Some(&waiting), 0, 0);
+    w.surface.commit();
+    waiting.destroy();
+    h.roundtrip();
+    imports_succeed(&mut h);
+    assert_eq!(
+        h.server.window_parts(id),
+        parts,
+        "the window keeps its picture"
+    );
+    assert!(!h.c(ci).is_disconnected());
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn gpu_case_10_disconnecting_with_images_waiting_or_shown_releases_them() {
+    let mut h = gpu_harness();
+    let good = good_client(&mut h);
+    let ci = h.connect();
+    let g = globals(h.c(ci));
+    let d = dmabuf(&mut h, ci, 5);
+    let w = crate::surfaces::create_window(&mut h, ci, &g);
+    crate::surfaces::ack(&mut h, ci, &w);
+    let shown = immed(&mut h, ci, &d, 20, 10);
+    w.surface.attach(Some(&shown), 0, 0);
+    w.surface.commit();
+    h.roundtrip();
+    imports_succeed(&mut h);
+    let waiting = immed(&mut h, ci, &d, 20, 10);
+    w.surface.attach(Some(&waiting), 0, 0);
+    w.surface.commit();
+    h.roundtrip();
+    h.clients.remove(ci);
+    // Let the server see the connection go, with an import still pending.
+    h.server.dispatch().expect("dispatch");
+    imports_succeed(&mut h);
+    h.server.release_images(None);
+    assert_eq!(
+        h.server.take_destroyed_images().len(),
+        2,
+        "both images are gone"
+    );
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn gpu_case_11_feedback_for_a_surface_destroyed_right_after_is_inert() {
+    // A client library cannot name a destroyed object in a request, so the closest a test can get
+    // is both in one batch: the server meets the request first and the surface is gone by the
+    // time anything is answered.
+    let mut h = gpu_harness();
+    let good = good_client(&mut h);
+    let ci = h.connect();
+    let g = globals(h.c(ci));
+    let d = dmabuf(&mut h, ci, 5);
+    let qh = h.c(ci).qh.clone();
+    let surface = g.compositor.create_surface(&qh, ());
+    let _f = d.get_surface_feedback(&surface, &qh, ());
+    surface.destroy();
+    h.roundtrip();
+    let c = h.c(ci);
+    assert!(!c.is_disconnected(), "{:?}", c.error());
     assert_good_client_works(&mut h, &good);
 }
 

@@ -11,6 +11,8 @@ use std::ffi::{CStr, c_char, c_void};
 use khronos_egl as egl;
 use thiserror::Error;
 
+use super::image::{ImageDesc, dma_buf_attribs};
+
 const PLATFORM_GBM_KHR: egl::Enum = 0x31D7;
 const PLATFORM_DEVICE_EXT: egl::Enum = 0x313F;
 const PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31DD;
@@ -19,6 +21,53 @@ type QueryDevicesExt =
     unsafe extern "system" fn(max: egl::Int, devices: *mut *mut c_void, num: *mut egl::Int) -> u32;
 type QueryDeviceStringExt =
     unsafe extern "system" fn(device: *mut c_void, name: egl::Int) -> *const c_char;
+type CreateImageKhr = unsafe extern "system" fn(
+    display: *mut c_void,
+    context: *mut c_void,
+    target: u32,
+    buffer: *mut c_void,
+    attribs: *const egl::Int,
+) -> *mut c_void;
+type DestroyImageKhr = unsafe extern "system" fn(display: *mut c_void, image: *mut c_void) -> u32;
+type QueryDmaBufFormatsExt = unsafe extern "system" fn(
+    display: *mut c_void,
+    max: egl::Int,
+    formats: *mut egl::Int,
+    num: *mut egl::Int,
+) -> u32;
+type QueryDmaBufModifiersExt = unsafe extern "system" fn(
+    display: *mut c_void,
+    format: egl::Int,
+    max: egl::Int,
+    modifiers: *mut u64,
+    external_only: *mut u32,
+    num: *mut egl::Int,
+) -> u32;
+
+const LINUX_DMA_BUF_EXT: u32 = 0x3270;
+const GL_TEXTURE_2D_KHR: u32 = 0x30B1;
+
+/// An EGLImage: destroyed when dropped, which must be before its `Egl`.
+pub struct EglImage {
+    display: *mut c_void,
+    image: *mut c_void,
+    destroy: DestroyImageKhr,
+}
+
+impl EglImage {
+    /// The handle for `glEGLImageTargetTexture2DOES`.
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
+        self.image
+    }
+}
+
+impl Drop for EglImage {
+    fn drop(&mut self) {
+        // SAFETY: `image` came from `eglCreateImageKHR` on `display`, is destroyed only here, and
+        // its owner drops it before the display goes (see the type's contract).
+        unsafe { (self.destroy)(self.display, self.image) };
+    }
+}
 
 /// Errors while setting up EGL or GLES.
 #[derive(Debug, Error)]
@@ -34,6 +83,8 @@ pub enum EglError {
     MissingExtension(&'static str),
     #[error("no software rendering device (EGL_MESA_device_software) found")]
     NoSoftwareDevice,
+    #[error("the image description has values EGL cannot take")]
+    BadImage,
 }
 
 fn call<T>(name: &'static str, result: Result<T, egl::Error>) -> Result<T, EglError> {
@@ -201,6 +252,141 @@ impl Egl {
             "eglSwapBuffers",
             egl::API.swap_buffers(self.display, surface),
         )
+    }
+
+    /// Whether this display can import GPU images with explicit layouts (FR-014).
+    pub fn can_import(&self) -> bool {
+        egl::API
+            .query_string(Some(self.display), egl::EXTENSIONS)
+            .ok()
+            .and_then(|s| s.to_str().ok())
+            .is_some_and(|all| {
+                all.split(' ')
+                    .any(|e| e == "EGL_EXT_image_dma_buf_import_modifiers")
+            })
+    }
+
+    /// Each format this GPU samples with its modifiers, external-only ones included (research G2).
+    pub fn dma_buf_formats(&self) -> Result<Vec<(u32, Vec<u64>)>, EglError> {
+        let query_formats = egl::API
+            .get_proc_address("eglQueryDmaBufFormatsEXT")
+            .ok_or(EglError::MissingExtension("eglQueryDmaBufFormatsEXT"))?;
+        let query_modifiers = egl::API
+            .get_proc_address("eglQueryDmaBufModifiersEXT")
+            .ok_or(EglError::MissingExtension("eglQueryDmaBufModifiersEXT"))?;
+        // SAFETY: both names come from EGL_EXT_image_dma_buf_import_modifiers, whose specification
+        // defines exactly these signatures.
+        let (query_formats, query_modifiers) = unsafe {
+            (
+                std::mem::transmute::<extern "system" fn(), QueryDmaBufFormatsExt>(query_formats),
+                std::mem::transmute::<extern "system" fn(), QueryDmaBufModifiersExt>(
+                    query_modifiers,
+                ),
+            )
+        };
+        let display = self.display.as_ptr();
+        let mut count: egl::Int = 0;
+        // SAFETY: a valid display; with a maximum of 0 only `count`, a valid out pointer, is
+        // written.
+        if unsafe { query_formats(display, 0, std::ptr::null_mut(), &mut count) } == 0 {
+            return Err(EglError::MissingExtension("eglQueryDmaBufFormatsEXT"));
+        }
+        let mut formats = vec![0 as egl::Int; count.max(0) as usize];
+        // SAFETY: `formats` has room for the `count` entries announced.
+        if unsafe { query_formats(display, count, formats.as_mut_ptr(), &mut count) } == 0 {
+            return Err(EglError::MissingExtension("eglQueryDmaBufFormatsEXT"));
+        }
+        formats.truncate(count.max(0) as usize);
+        let mut out = Vec::with_capacity(formats.len());
+        for format in formats {
+            let mut n: egl::Int = 0;
+            let null = std::ptr::null_mut();
+            // SAFETY: as above, with a maximum of 0 only `n` is written; the external-only array
+            // may be null.
+            if unsafe { query_modifiers(display, format, 0, null, null.cast(), &mut n) } == 0 {
+                continue;
+            }
+            let mut modifiers = vec![0u64; n.max(0) as usize];
+            let mut external = vec![0u32; n.max(0) as usize];
+            // SAFETY: both arrays have room for the `n` entries announced.
+            let ok = unsafe {
+                query_modifiers(
+                    display,
+                    format,
+                    n,
+                    modifiers.as_mut_ptr(),
+                    external.as_mut_ptr(),
+                    &mut n,
+                )
+            };
+            if ok == 0 {
+                continue;
+            }
+            modifiers.truncate(n.max(0) as usize);
+            out.push((format as u32, modifiers));
+        }
+        Ok(out)
+    }
+
+    /// Imports a GPU image. Never waits for the image to be finished; failing affects only it.
+    pub fn import_dma_buf(&self, desc: &ImageDesc<'_>) -> Result<EglImage, EglError> {
+        let attribs = dma_buf_attribs(desc).ok_or(EglError::BadImage)?;
+        self.create_image(
+            std::ptr::null_mut(),
+            LINUX_DMA_BUF_EXT,
+            std::ptr::null_mut(),
+            &attribs,
+        )
+    }
+
+    /// An image of an ordinary GL texture of this context: how rendering tests get external
+    /// textures with no dma-buf and no device (research G11).
+    pub fn image_from_texture(&self, texture: u32) -> Result<EglImage, EglError> {
+        self.create_image(
+            self.context.as_ptr(),
+            GL_TEXTURE_2D_KHR,
+            texture as usize as *mut c_void,
+            &[egl::NONE],
+        )
+    }
+
+    fn create_image(
+        &self,
+        context: *mut c_void,
+        target: u32,
+        buffer: *mut c_void,
+        attribs: &[egl::Int],
+    ) -> Result<EglImage, EglError> {
+        let create = egl::API
+            .get_proc_address("eglCreateImageKHR")
+            .ok_or(EglError::MissingExtension("eglCreateImageKHR"))?;
+        let destroy = egl::API
+            .get_proc_address("eglDestroyImageKHR")
+            .ok_or(EglError::MissingExtension("eglDestroyImageKHR"))?;
+        // SAFETY: both names come from EGL_KHR_image_base, whose specification defines exactly
+        // these signatures.
+        let (create, destroy) = unsafe {
+            (
+                std::mem::transmute::<extern "system" fn(), CreateImageKhr>(create),
+                std::mem::transmute::<extern "system" fn(), DestroyImageKhr>(destroy),
+            )
+        };
+        let display = self.display.as_ptr();
+        // SAFETY: a valid display; `attribs` is `NONE`-terminated and read only during the call;
+        // file descriptors in it are duplicated by the driver if it needs them later.
+        let image = unsafe { create(display, context, target, buffer, attribs.as_ptr()) };
+        if image.is_null() {
+            let source = egl::API.get_error().unwrap_or(egl::Error::BadParameter);
+            return Err(EglError::Call {
+                call: "eglCreateImageKHR",
+                source,
+            });
+        }
+        Ok(EglImage {
+            display,
+            image,
+            destroy,
+        })
     }
 
     /// A `glow` context for the current EGL context.

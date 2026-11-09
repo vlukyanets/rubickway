@@ -8,10 +8,11 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 
 use rubickway::server::Server;
-use wayland_client::backend::ObjectId;
 use wayland_client::backend::protocol::ProtocolError;
+use wayland_client::backend::{ObjectData, ObjectId};
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_shm::{self, WlShm};
@@ -60,6 +61,11 @@ where
             object: proxy.id(),
             event: any,
         });
+    }
+
+    /// The one event that creates an object here: `zwp_linux_buffer_params_v1.created`.
+    fn event_created_child(_: u16, qh: &QueueHandle<Self>) -> Arc<dyn ObjectData> {
+        qh.make_data::<WlBuffer, ()>(())
     }
 }
 

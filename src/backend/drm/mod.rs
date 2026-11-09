@@ -14,6 +14,7 @@ mod input;
 mod keyboard;
 mod session;
 mod surface;
+mod timelines;
 
 use thiserror::Error;
 
@@ -378,6 +379,18 @@ impl DrmBackend {
         Ok((session, card, input))
     }
 
+    /// The GPU's render node and its device number (research G2).
+    pub fn render_node(&self) -> io::Result<(PathBuf, u64)> {
+        gpu::render_node_of(&self.card_path)
+    }
+
+    /// Explicit synchronisation on the GPU's render node; `None` if its driver has no timelines.
+    pub fn timelines(&self) -> io::Result<Option<Rc<dyn crate::server::Timelines>>> {
+        let (node, _) = self.render_node()?;
+        let timelines = timelines::RenderNodeTimelines::open(&node)?;
+        Ok(timelines.map(|t| Rc::new(t) as Rc<dyn crate::server::Timelines>))
+    }
+
     /// The EGL display and context all outputs draw with.
     pub fn egl(&self) -> &Egl {
         &self.egl
@@ -524,9 +537,11 @@ impl DrmBackend {
             return Ok(false);
         };
         let egl_surface = self.outputs[i].surface.egl_surface();
+        let started = std::time::Instant::now();
         self.egl
             .swap_buffers(egl_surface)
             .map_err(|e| DrmError::Lost(format!("EGL: {e}")))?;
+        let swapped = started.elapsed();
         let fb = match self.outputs[i].surface.lock_front(&self.gbm) {
             Ok(fb) => fb,
             Err(err) => {
@@ -538,7 +553,15 @@ impl DrmBackend {
             }
         };
         let o = &mut self.outputs[i];
-        match device::commit(&self.gbm, &o.found, fb, o.needs_modeset) {
+        let commit = device::commit(&self.gbm, &o.found, fb, o.needs_modeset);
+        if started.elapsed().as_millis() >= 5 {
+            tracing::debug!(
+                "showing a frame: swap {} ms, then commit {} ms",
+                swapped.as_millis(),
+                started.elapsed().saturating_sub(swapped).as_millis()
+            );
+        }
+        match commit {
             Ok(()) => {
                 o.waiting_flip = true;
                 o.needs_modeset = false;

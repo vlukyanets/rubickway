@@ -1,5 +1,7 @@
 //! Thin wrappers around C interfaces that need `unsafe` (Principle V).
 
+pub mod clock;
+pub mod dmabuf;
 pub mod shm_map;
 pub mod signals;
 pub mod spawn;
