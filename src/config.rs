@@ -9,6 +9,7 @@ use std::time::Duration;
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use xkbcommon::xkb;
 
+use crate::distant::DistantWindows;
 use crate::input::bindings::{
     Bindings, KeyCombo, ModKey, PointerAction, PointerBind, PointerCombo, SpawnBind,
 };
@@ -26,6 +27,8 @@ pub struct Config {
     pub pointer: Vec<PointerConfig>,
     /// How long the event loop may be silent before RubickWay ends itself (FR-030).
     pub watchdog_timeout: Duration,
+    /// Less work for distant windows (FR-017); nothing set by default.
+    pub distant_windows: DistantWindows,
 }
 
 impl Default for Config {
@@ -35,6 +38,7 @@ impl Default for Config {
             spawns: vec![SpawnConfig::default()],
             pointer: default_pointer(),
             watchdog_timeout: Duration::from_secs(10),
+            distant_windows: DistantWindows::default(),
         }
     }
 }
@@ -445,6 +449,7 @@ impl Parser<'_> {
                 "input" => self.input(node),
                 "binds" => self.binds(node),
                 "watchdog-timeout-sec" => self.watchdog(node),
+                "distant-windows" => self.distant_windows(node),
                 other => self.warn(node, format!("unknown setting `{other}`, ignored")),
             }
         }
@@ -620,6 +625,56 @@ impl Parser<'_> {
         }
         if !pointer.is_empty() {
             self.config.pointer = pointer;
+        }
+    }
+
+    /// The `distant-windows` block (FR-017); every value is optional and works on its own.
+    fn distant_windows(&mut self, node: &KdlNode) {
+        let Some(children) = self.block(node) else {
+            return;
+        };
+        let mut distant = DistantWindows::default();
+        for child in self.each(children) {
+            match child.name().value() {
+                "below-zoom-percent" => distant.below_zoom_percent = self.ranged(child, 1, 100),
+                "max-fps" => distant.max_fps = self.ranged(child, 1, 240),
+                "copy-detail-percent" => distant.copy_detail_percent = self.ranged(child, 25, 400),
+                other => self.warn(
+                    child,
+                    format!("unknown setting `distant-windows > {other}`, ignored"),
+                ),
+            }
+        }
+        if distant.below_zoom_percent.is_none()
+            && (distant.max_fps.is_some() || distant.copy_detail_percent.is_some())
+        {
+            self.warn(
+                node,
+                "`distant-windows` does nothing without `below-zoom-percent`",
+            );
+        }
+        self.config.distant_windows = distant;
+    }
+
+    /// The single whole number argument of a leaf node, from `low` to `high`.
+    fn ranged(&mut self, node: &KdlNode, low: u32, high: u32) -> Option<u32> {
+        let value = match (node.entries(), node.children()) {
+            ([entry], None) if entry.name().is_none() => entry.value().as_integer(),
+            _ => None,
+        };
+        let value = value.and_then(|v| u32::try_from(v).ok());
+        match value {
+            Some(v) if (low..=high).contains(&v) => Some(v),
+            _ => {
+                self.warn(
+                    node,
+                    format!(
+                        "`{}` expects a whole number from {low} to {high}",
+                        node.name().value()
+                    ),
+                );
+                None
+            }
         }
     }
 

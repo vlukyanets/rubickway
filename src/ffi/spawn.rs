@@ -11,6 +11,37 @@ use std::ffi::OsString;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The soft and hard `RLIMIT_NOFILE` before [`raise_file_limit`]; `u64::MAX` soft means unchanged.
+static ORIGINAL_SOFT: AtomicU64 = AtomicU64::new(u64::MAX);
+static ORIGINAL_HARD: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Raises the soft `RLIMIT_NOFILE` to the hard limit: every plane of a GPU image holds a
+/// descriptor while the buffer lives (research G10). Programs started afterwards get the original
+/// back, so they do not inherit it.
+pub fn raise_file_limit() -> std::io::Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid out pointer for the duration of the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    ORIGINAL_SOFT.store(limit.rlim_cur, Ordering::Relaxed);
+    ORIGINAL_HARD.store(limit.rlim_max, Ordering::Relaxed);
+    let raised = libc::rlimit {
+        rlim_cur: limit.rlim_max,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: `raised` is a valid pointer for the duration of the call; the soft limit is not
+    // above the hard limit.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 /// How a started program ended, when that is worth logging (`contracts/cli.md`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,14 +90,22 @@ fn run(request: SpawnRequest, report: impl FnOnce(SpawnResult)) {
         cmd.current_dir(dir);
     }
     // SAFETY: the closure runs in the child between fork and exec and calls only
-    // async-signal-safe functions (sigemptyset, pthread_sigmask, setsid) on a local sigset; it
-    // allocates nothing and touches no locks.
+    // async-signal-safe functions (sigemptyset, pthread_sigmask, setsid, setrlimit) on local
+    // values, and reads atomics; it allocates nothing and touches no locks.
     unsafe {
         cmd.pre_exec(|| {
             let mut set: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut set);
             libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
             libc::setsid();
+            let soft = ORIGINAL_SOFT.load(Ordering::Relaxed);
+            if soft != u64::MAX {
+                let limit = libc::rlimit {
+                    rlim_cur: soft,
+                    rlim_max: ORIGINAL_HARD.load(Ordering::Relaxed),
+                };
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
             Ok(())
         });
     }
@@ -157,6 +196,32 @@ mod tests {
                       test \"$(ps -o sid= -p $$ | tr -d ' ')\" = \"$$\" || exit 3";
         let env = vec![(OsString::from("WAYLAND_DISPLAY"), OsString::from("wl-test"))];
         assert_eq!(run_and_collect(&["sh", "-c", script], env), Vec::new());
+    }
+
+    #[test]
+    fn a_program_gets_the_original_file_limit_back() {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: valid pointers for the duration of each call.
+        unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            // A low soft limit to start from, so raising it shows.
+            limit.rlim_cur = limit.rlim_max.min(1024);
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+        }
+        raise_file_limit().unwrap();
+        let mut raised = limit;
+        // SAFETY: a valid out pointer for the duration of the call.
+        let got = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut raised) };
+        assert_eq!(got, 0);
+        assert_eq!(raised.rlim_cur, limit.rlim_max, "raised to the hard limit");
+        let script = format!("test \"$(ulimit -Sn)\" = {} || exit 1", limit.rlim_cur);
+        assert_eq!(
+            run_and_collect(&["sh", "-c", &script], Vec::new()),
+            Vec::new()
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ uniform vec2 u_viewport;   // framebuffer size
 uniform vec4 u_dst;        // x, y, width, height in pixels
 uniform vec4 u_src;        // crop in normalised surface coordinates: x, y, width, height
 uniform int u_transform;   // wl_output.transform value, 0..7
+uniform float u_y_invert;  // 1.0 for an image marked as vertically flipped
 
 out vec2 v_uv;
 
@@ -29,4 +30,5 @@ void main() {
     vec2 ndc = px / u_viewport * 2.0 - 1.0;
     gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
     v_uv = to_buffer(u_src.xy + corner * u_src.zw);
+    if (u_y_invert > 0.5) v_uv.y = 1.0 - v_uv.y;
 }

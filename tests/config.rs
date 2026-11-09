@@ -337,6 +337,93 @@ fn the_default_binding_resolves_with_the_configured_mod() {
     );
 }
 
+// --- gpu-buffers: distant windows (T047, FR-017) ------------------------------------------
+
+#[test]
+fn with_no_block_nothing_is_set_for_distant_windows() {
+    assert_eq!(
+        parse("").0.distant_windows,
+        rubickway::distant::DistantWindows::default()
+    );
+}
+
+#[test]
+fn every_value_for_distant_windows_is_read() {
+    let (config, warnings) = parse(
+        "distant-windows {\n\
+         below-zoom-percent 50\n\
+         max-fps 15\n\
+         copy-detail-percent 200\n\
+         }",
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let d = config.distant_windows;
+    assert_eq!(d.below_zoom_percent, Some(50));
+    assert_eq!(d.max_fps, Some(15));
+    assert_eq!(d.copy_detail_percent, Some(200));
+}
+
+#[test]
+fn values_for_distant_windows_work_alone() {
+    let (config, warnings) = parse("distant-windows {\nbelow-zoom-percent 25\nmax-fps 10\n}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(config.distant_windows.copy_detail_percent, None);
+}
+
+#[test]
+fn the_ends_of_each_range_for_distant_windows_are_allowed() {
+    for text in [
+        "below-zoom-percent 1\nmax-fps 1\ncopy-detail-percent 25",
+        "below-zoom-percent 100\nmax-fps 240\ncopy-detail-percent 400",
+    ] {
+        let (_, warnings) = parse(&format!("distant-windows {{\n{text}\n}}"));
+        assert!(warnings.is_empty(), "{text}: {warnings:?}");
+    }
+}
+
+#[test]
+fn a_wrong_value_for_distant_windows_is_a_warning_with_its_line() {
+    for line in [
+        "below-zoom-percent 0",
+        "below-zoom-percent 101",
+        "below-zoom-percent \"half\"",
+        "max-fps 0",
+        "max-fps 241",
+        "copy-detail-percent 24",
+        "copy-detail-percent 401",
+        "copy-detail-percent 1.5",
+        "copy-detail-percent 100 100",
+    ] {
+        let good = if line.starts_with("below") {
+            "max-fps 10"
+        } else {
+            "below-zoom-percent 50"
+        };
+        let (config, warnings) = parse(&format!("distant-windows {{\n{good}\n{line}\n}}"));
+        assert!(lines(&warnings).contains(&Some(3)), "{line}: {warnings:?}");
+        let d = config.distant_windows;
+        if line.starts_with("below") {
+            assert_eq!(d.below_zoom_percent, None, "{line}");
+        } else if line.starts_with("max") {
+            assert_eq!(d.max_fps, None, "{line}");
+        } else {
+            assert_eq!(d.copy_detail_percent, None, "{line}");
+        }
+    }
+}
+
+#[test]
+fn distant_values_without_the_zoom_are_a_warning() {
+    let (_, warnings) = parse("distant-windows {\nmax-fps 10\n}");
+    assert_eq!(lines(&warnings), vec![Some(1)], "{warnings:?}");
+}
+
+#[test]
+fn an_unknown_setting_for_distant_windows_is_a_warning() {
+    let (_, warnings) = parse("distant-windows {\nbelow-zoom-percent 50\nbrightness 3\n}");
+    assert_eq!(lines(&warnings), vec![Some(3)], "{warnings:?}");
+}
+
 // --- User Story 5: the watchdog timeout (T058, FR-024, FR-030) -------------------------------
 
 #[test]

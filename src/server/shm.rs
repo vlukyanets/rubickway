@@ -12,6 +12,7 @@ use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
 };
 
+use super::dmabuf::GpuBuffer;
 use super::{ServerState, ShmImage, SurfaceKey};
 use crate::ffi::shm_map::ShmMap;
 
@@ -24,12 +25,35 @@ pub(crate) struct Pool {
     map: Rc<RefCell<ShmMap>>,
 }
 
+/// What a `wl_buffer` is.
+pub(crate) enum BufferKind {
+    Shm(ShmBuffer),
+    Gpu(GpuBuffer),
+}
+
+impl BufferKind {
+    /// Width and height in pixels.
+    pub fn size(&self) -> (i32, i32) {
+        match self {
+            BufferKind::Shm(b) => (b.width, b.height),
+            BufferKind::Gpu(b) => (b.width, b.height),
+        }
+    }
+
+    fn as_shm(&self) -> Option<&ShmBuffer> {
+        match self {
+            BufferKind::Shm(b) => Some(b),
+            BufferKind::Gpu(_) => None,
+        }
+    }
+}
+
 /// A buffer inside a pool.
 pub(crate) struct ShmBuffer {
     map: Rc<RefCell<ShmMap>>,
     offset: usize,
-    pub width: i32,
-    pub height: i32,
+    width: i32,
+    height: i32,
     stride: i32,
     opaque: bool,
 }
@@ -132,14 +156,14 @@ impl Dispatch<WlShmPool, ()> for ServerState {
                 }
                 state.buffers.insert(
                     buffer.id(),
-                    ShmBuffer {
+                    BufferKind::Shm(ShmBuffer {
                         map: pool.map.clone(),
                         offset: offset as usize,
                         width,
                         height,
                         stride,
                         opaque,
-                    },
+                    }),
                 );
             }
             wl_shm_pool::Request::Resize { size } => {
@@ -181,7 +205,9 @@ impl Dispatch<WlBuffer, ()> for ServerState {
     }
 
     fn destroyed(state: &mut Self, _: ClientId, resource: &WlBuffer, _: &()) {
-        state.buffers.remove(&resource.id());
+        if let Some(BufferKind::Gpu(buffer)) = state.buffers.remove(&resource.id()) {
+            state.destroyed_images.push(buffer.key);
+        }
     }
 }
 
@@ -203,7 +229,7 @@ pub(crate) fn upload_pending(
         .filter_map(|(id, s)| s.upload.take().map(|b| (id.clone(), s.key, b)))
         .collect();
     for (surface, key, buffer) in pending {
-        let Some(shm) = state.buffers.get(&buffer.id()) else {
+        let Some(shm) = state.buffers.get(&buffer.id()).and_then(BufferKind::as_shm) else {
             continue;
         };
         let (Ok(width), Ok(height), Ok(stride)) = (

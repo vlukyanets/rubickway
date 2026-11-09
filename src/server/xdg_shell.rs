@@ -344,8 +344,32 @@ pub(crate) fn set_activated(state: &mut ServerState, window: WindowId, activated
     }
 }
 
-/// Called after a surface of the tree rooted at `root` committed (`committed`).
-pub(crate) fn tree_committed(state: &mut ServerState, root: &ObjectId, committed: &ObjectId) {
+/// An `xdg_surface`'s double-buffered values at a commit, taken with the commit so a later request
+/// cannot change what it applies (research G7).
+pub(crate) struct XdgCapture {
+    geometry: Option<Rect>,
+    limits: SizeLimits,
+}
+
+/// What a commit on `surface` takes from its `xdg_surface`, if it has one.
+pub(crate) fn capture(state: &ServerState, surface: &ObjectId) -> Option<XdgCapture> {
+    let x = state
+        .xdg_surfaces
+        .get(&xdg_id_of_surface(state, surface)?)?;
+    Some(XdgCapture {
+        geometry: x.pending_geometry,
+        limits: x.pending_limits,
+    })
+}
+
+/// Called after a surface of the tree rooted at `root` committed (`committed`), with what the
+/// commit captured from its `xdg_surface`.
+pub(crate) fn tree_committed(
+    state: &mut ServerState,
+    root: &ObjectId,
+    committed: &ObjectId,
+    capture: Option<XdgCapture>,
+) {
     let Some(xdg_id) = xdg_id_of_surface(state, root) else {
         return;
     };
@@ -356,9 +380,11 @@ pub(crate) fn tree_committed(state: &mut ServerState, root: &ObjectId, committed
     let Some(x) = state.xdg_surfaces.get_mut(&xdg_id) else {
         return;
     };
-    if committed == root {
-        x.geometry = x.pending_geometry;
-        x.limits = x.pending_limits;
+    if committed == root
+        && let Some(capture) = capture
+    {
+        x.geometry = capture.geometry;
+        x.limits = capture.limits;
     }
     if !matches!(x.role, XdgRole::Toplevel(_)) {
         return;
@@ -388,7 +414,7 @@ pub(crate) fn tree_committed(state: &mut ServerState, root: &ObjectId, committed
             if x.wants_maximized || x.wants_fullscreen {
                 // The shell answers with the initial configure (research W13).
                 let (maximized, fullscreen, limits) =
-                    (x.wants_maximized, x.wants_fullscreen, x.pending_limits);
+                    (x.wants_maximized, x.wants_fullscreen, x.limits);
                 x.awaiting_shell = true;
                 let id = state.new_window_id();
                 let parent = parent_window(state, &xdg_id);

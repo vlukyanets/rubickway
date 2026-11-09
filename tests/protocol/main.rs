@@ -5,11 +5,14 @@
     reason = "test harness helpers fail loudly; clippy.toml only exempts #[test] functions"
 )]
 
+mod commits;
+mod dmabuf;
 mod harness;
 mod input;
 mod misbehaving;
 mod outputs;
 mod surfaces;
+mod syncobj;
 mod wm;
 
 use harness::Harness;
