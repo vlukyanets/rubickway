@@ -18,9 +18,14 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1
 };
 use wayland_protocols::xdg::shell::client::xdg_toplevel;
 
+use rubickway::shell::CursorName;
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
+
 use crate::commits::unfinished;
+use crate::cursor_shape::{set_raw_shape, shape, shape_client};
 use crate::dmabuf::{ARGB, dmabuf, gpu_harness, immed, imports_succeed};
 use crate::harness::{Harness, solid_buffer, temp_file};
+use crate::input::enter_pointer;
 use crate::surfaces::{Window, globals, open_window};
 use crate::syncobj::{Sync, sync_client, sync_harness};
 
@@ -884,4 +889,102 @@ fn windows_opened_and_closed_while_paused_are_reported_in_order() {
     );
     assert_ne!(gone_id, new_id);
     assert!(!h.c(c).is_disconnected());
+}
+
+// --- Cursor shapes (cursor-shapes contracts/protocols.md "Misbehaving applications") ----------
+
+const INVALID_SHAPE: u32 = 1;
+
+#[test]
+fn shape_values_outside_the_enum_disconnect_only_the_offender() {
+    for value in [0, 37, u32::MAX] {
+        let mut h = Harness::new();
+        let good = good_client(&mut h);
+        let bad = shape_client(&mut h, 2);
+        let serial = enter_pointer(&mut h, bad.index, bad.id);
+        set_raw_shape(&bad.device, serial, value);
+        h.roundtrip();
+        let error = h.c(bad.index).error().expect("disconnected with an error");
+        assert_eq!(error.code, INVALID_SHAPE, "value {value}");
+        assert_eq!(error.object_interface, "wp_cursor_shape_device_v1");
+        assert_good_client_works(&mut h, &good);
+    }
+}
+
+#[test]
+fn version_2_shapes_on_a_version_1_device_are_an_error() {
+    for value in [35, 36] {
+        let mut h = Harness::new();
+        let good = good_client(&mut h);
+        let bad = shape_client(&mut h, 1);
+        let serial = enter_pointer(&mut h, bad.index, bad.id);
+        // The newest version 1 shape works.
+        set_raw_shape(&bad.device, serial, 34);
+        h.roundtrip();
+        assert!(!h.c(bad.index).is_disconnected());
+        set_raw_shape(&bad.device, serial, value);
+        h.roundtrip();
+        let error = h.c(bad.index).error().expect("disconnected with an error");
+        assert_eq!(error.code, INVALID_SHAPE, "value {value}");
+        assert_good_client_works(&mut h, &good);
+    }
+}
+
+#[test]
+fn a_flood_of_shape_requests_reports_only_changes() {
+    let mut h = Harness::new();
+    let s = shape_client(&mut h, 2);
+    let serial = enter_pointer(&mut h, s.index, s.id);
+    h.server.take_window_events();
+    for _ in 0..10_000 {
+        set_raw_shape(&s.device, serial, 9); // text
+    }
+    h.roundtrip();
+    assert_eq!(
+        h.server.take_window_events().len(),
+        1,
+        "repeats change nothing"
+    );
+    for i in 0..10_000u32 {
+        set_raw_shape(&s.device, serial, if i % 2 == 0 { 4 } else { 9 });
+    }
+    h.roundtrip();
+    assert_eq!(
+        h.server.take_window_events().len(),
+        10_000,
+        "one per change"
+    );
+    assert!(!h.c(s.index).is_disconnected());
+}
+
+#[test]
+fn a_client_gone_with_its_shape_shown_leaves_nothing_behind() {
+    let mut h = Harness::new();
+    let next = shape_client(&mut h, 2);
+    let gone = shape_client(&mut h, 2);
+    let serial = enter_pointer(&mut h, gone.index, gone.id);
+    gone.device.set_shape(serial, Shape::Text);
+    h.roundtrip();
+    let id = gone.id;
+    drop(gone);
+    let client = h.clients.remove(1);
+    drop(client);
+    h.roundtrip();
+    assert!(
+        h.server
+            .take_window_events()
+            .contains(&WindowEvent::Unmapped { id })
+    );
+    // The next window starts from the arrow.
+    let serial = enter_pointer(&mut h, next.index, next.id);
+    assert_eq!(
+        h.server.take_window_events(),
+        vec![shape(next.id, CursorName::Default)]
+    );
+    next.device.set_shape(serial, Shape::Pointer);
+    h.roundtrip();
+    assert_eq!(
+        h.server.take_window_events(),
+        vec![shape(next.id, CursorName::Pointer)]
+    );
 }

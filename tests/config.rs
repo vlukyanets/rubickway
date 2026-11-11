@@ -337,6 +337,52 @@ fn the_default_binding_resolves_with_the_configured_mod() {
     );
 }
 
+// --- cursor-shapes: the cursor theme (T022, FR-010, contracts/config.md) --------------------
+
+#[test]
+fn the_cursor_theme_is_read() {
+    let (config, warnings) = parse("cursor {\n    theme \"Adwaita\"\n}");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(config.cursor_theme.as_deref(), Some("Adwaita"));
+}
+
+#[test]
+fn without_a_theme_none_is_set() {
+    for text in ["", "cursor {\n}"] {
+        let (config, warnings) = parse(text);
+        assert!(warnings.is_empty(), "{text:?}: {warnings:?}");
+        assert_eq!(config.cursor_theme, None, "{text:?}");
+    }
+}
+
+#[test]
+fn a_bad_cursor_theme_is_a_warning_with_its_line_and_is_not_used() {
+    for value in [
+        "\"\"",
+        "\".\"",
+        "\"..\"",
+        "\"a/b\"",
+        "\"/usr/share/icons/Adwaita\"",
+        "24",
+        "\"Adwaita\" \"Breeze\"",
+    ] {
+        let (config, warnings) = parse(&format!("cursor {{\n    theme {value}\n}}"));
+        assert_eq!(config.cursor_theme, None, "{value}");
+        assert_eq!(lines(&warnings), vec![Some(2)], "{value}: {warnings:?}");
+    }
+}
+
+#[test]
+fn an_unknown_cursor_setting_is_a_warning() {
+    let (config, warnings) = parse("cursor {\n    theme \"Adwaita\"\n    size 48\n}");
+    assert_eq!(config.cursor_theme.as_deref(), Some("Adwaita"));
+    assert_eq!(lines(&warnings), vec![Some(3)], "{warnings:?}");
+    assert!(
+        warnings[0].message.contains("cursor > size"),
+        "{warnings:?}"
+    );
+}
+
 // --- gpu-buffers: distant windows (T047, FR-017) ------------------------------------------
 
 #[test]

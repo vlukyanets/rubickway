@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use rubickway::canvas::{Camera, Point, Size};
 use rubickway::render::cursor::{self, CursorKind};
 use rubickway::render::{self, BACKGROUND, GridParams, ImageRef, Quad, Transform};
+use rubickway::shell::CursorName;
 
 static GPU: Mutex<()> = Mutex::new(());
 
@@ -230,16 +231,17 @@ fn thin_lines_shrunk_to_25_percent_read_as_even_grey() {
 fn the_pointer_is_drawn_last_with_its_hotspot_at_the_pointer() {
     // The built-in arrow: hotspot (0, 0), a black outline at its top-left 2x2 pixels, white
     // fill at (2, 4), transparent at (23, 0) (render::cursor tests).
-    let arrow = cursor::builtin(CursorKind::Arrow);
+    let kind = CursorKind::Shape(CursorName::Default);
+    let arrow = cursor::builtin(kind);
     let white = solid(60, 60, 0xffff_ffff);
     let img = render(
         &[
             (1, image(&white, 60, 60, true)),
-            (CursorKind::Arrow.texture_key(), arrow.image_ref()),
+            (kind.texture_key(), arrow.image_ref()),
         ],
         &[
             quad(1, 80.0, 30.0, 60.0, 60.0),
-            arrow.quad(CursorKind::Arrow, (100.0, 50.0)),
+            arrow.quad(kind, (100.0, 50.0)),
         ],
     );
     assert_rgb(
@@ -262,18 +264,19 @@ fn the_pointer_is_drawn_last_with_its_hotspot_at_the_pointer() {
 
 #[test]
 fn the_pointer_is_drawn_above_a_fullscreen_window() {
-    let grab = cursor::builtin(CursorKind::Grab);
+    let kind = CursorKind::Shape(CursorName::Grabbing);
+    let grab = cursor::builtin(kind);
     let red = solid(W, H, 0xffff_0000);
     let img = {
         let _guard = GPU.lock().unwrap_or_else(|e| e.into_inner());
         match render::offscreen_fullscreen_scene(
             &[
                 (1, image(&red, W, H, true)),
-                (CursorKind::Grab.texture_key(), grab.image_ref()),
+                (kind.texture_key(), grab.image_ref()),
             ],
             &[
                 quad(1, 0.0, 0.0, W as f32, H as f32),
-                grab.quad(CursorKind::Grab, (160.0, 100.0)),
+                grab.quad(kind, (160.0, 100.0)),
             ],
             W,
             H,

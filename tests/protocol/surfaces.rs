@@ -132,6 +132,7 @@ fn globals_and_versions_match_the_contract() {
         ("wl_seat", 8),
         ("wl_shm", 1),
         ("wl_subcompositor", 1),
+        ("wp_cursor_shape_manager_v1", 2),
         ("wp_fractional_scale_manager_v1", 1),
         ("wp_viewporter", 1),
         ("xdg_wm_base", 6),

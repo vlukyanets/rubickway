@@ -27,11 +27,11 @@ use crate::config::{Config, config_path};
 use crate::distant::{DistantWindows, FramePace};
 use crate::ffi::clock::thread_cpu_time;
 use crate::ffi::spawn::{self, SpawnRequest, SpawnResult};
-use crate::render::cursor::{self, CursorImage, CursorKind};
+use crate::render::cursor::{self, CursorKind, PointerImages};
 use crate::render::formats;
 use crate::render::{FULLSCREEN_BACKGROUND, GlesRenderer, ImageDesc, ImageRef, PlaneDesc, Quad};
 use crate::server::{Damage, OutputDesc, Server, WaitId};
-use crate::shell::{CursorShape, Edges, Shell, WindowEvent, WindowId};
+use crate::shell::{CursorName, CursorShape, Edges, Shell, WindowEvent, WindowId};
 use crate::state::AppError;
 use crate::watchdog::Heartbeat;
 
@@ -72,7 +72,9 @@ struct App {
     listener: ListeningSocket,
     shell: Shell,
     outputs: HashMap<ViewerId, OutputState>,
-    cursors: Vec<(CursorKind, CursorImage)>,
+    cursors: PointerImages,
+    /// Shapes already reported as shown with the arrow (cursor-shapes FR-007).
+    arrow_noted: HashSet<CursorName>,
     /// Where the pointer was drawn last, and with which image.
     drawn_pointer: Option<(ViewerId, Point, Option<CursorKind>)>,
     /// The windows each display shows now, and those it showed now or one step ago (a window
@@ -229,7 +231,18 @@ pub fn run() -> Result<(), AppError> {
         .map_err(|e| AppError::Loop(e.to_string()))?;
 
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let cursors = cursor::load(&cursor::icon_dirs(home.as_deref()));
+    // The cursor theme is read here, before the loop runs (cursor-shapes research C12).
+    let (cursors, report) = cursor::load(
+        &cursor::icon_dirs(home.as_deref()),
+        config.cursor_theme.as_deref(),
+    );
+    for line in report.lines() {
+        if line.warn {
+            tracing::warn!("{}", line.text);
+        } else {
+            tracing::info!("{}", line.text);
+        }
+    }
     let mut app = App {
         renderer: Some(renderer),
         backend,
@@ -238,6 +251,7 @@ pub fn run() -> Result<(), AppError> {
         shell: Shell::with_bindings(config.bindings()),
         outputs: HashMap::new(),
         cursors,
+        arrow_noted: HashSet::new(),
         drawn_pointer: None,
         shown: HashMap::new(),
         recently_shown: HashMap::new(),
@@ -402,7 +416,7 @@ impl App {
         let Some(renderer) = &mut self.renderer else {
             return;
         };
-        for (kind, image) in &self.cursors {
+        for (kind, image) in self.cursors.iter() {
             if let Err(err) = renderer.upload(kind.texture_key(), image.image_ref()) {
                 tracing::warn!("cannot upload the pointer image {kind:?}: {err}");
             }
@@ -683,17 +697,17 @@ impl App {
                 }
             }
         }
+        if let Some((_, _, Some(kind))) = now {
+            let stand_in = self.cursors.arrow_stand_in(kind);
+            if let Some(line) = arrow_stand_in_note(&mut self.arrow_noted, kind, stand_in) {
+                tracing::info!("{line}");
+            }
+        }
     }
 
     /// The image for the shell's cursor shape; `None` hides the pointer.
     fn pointer_kind(&self) -> Option<CursorKind> {
-        Some(match self.shell.cursor() {
-            CursorShape::Default => CursorKind::Arrow,
-            CursorShape::Grabbing => CursorKind::Grab,
-            CursorShape::Move => CursorKind::Move,
-            CursorShape::Resize(edges) => resize_kind(edges),
-            CursorShape::Hidden => return None,
-        })
+        pointer_kind(self.shell.cursor())
     }
 
     /// Copies newly committed buffers into textures and frees textures of destroyed surfaces.
@@ -954,7 +968,7 @@ impl App {
             return None;
         }
         let kind = self.pointer_kind()?;
-        let (_, image) = self.cursors.iter().find(|(k, _)| *k == kind)?;
+        let image = self.cursors.get(kind)?;
         Some(image.quad(kind, (pos.x as f32, pos.y as f32)))
     }
 
@@ -1020,13 +1034,46 @@ fn needs_frame(damage: &Damage, shown: &[WindowId]) -> bool {
     damage.all || damage.windows.iter().any(|w| shown.contains(w))
 }
 
-/// The image for a resize from `edges`.
-fn resize_kind(edges: Edges) -> CursorKind {
+/// The image for the shell's cursor shape (cursor-shapes data-model "App"); `None` hides the
+/// pointer.
+fn pointer_kind(shape: CursorShape) -> Option<CursorKind> {
+    Some(match shape {
+        CursorShape::Default => CursorKind::Shape(CursorName::Default),
+        CursorShape::Grabbing => CursorKind::Shape(CursorName::Grabbing),
+        CursorShape::Move => CursorKind::WindowMove,
+        CursorShape::Resize(edges) => CursorKind::Shape(resize_name(edges)),
+        CursorShape::Named(name) => CursorKind::Shape(name),
+        CursorShape::Hidden => return None,
+    })
+}
+
+/// The line for the first time a shape is shown with the arrow because there is no image for
+/// it (`stand_in`), once per shape per run (cursor-shapes FR-007, contracts/cli.md).
+fn arrow_stand_in_note(
+    noted: &mut HashSet<CursorName>,
+    kind: CursorKind,
+    stand_in: bool,
+) -> Option<String> {
+    let CursorKind::Shape(name) = kind else {
+        return None;
+    };
+    if !stand_in || !noted.insert(name) {
+        return None;
+    }
+    Some(format!(
+        "an application asked for the {} pointer, which RubickWay has no image for: showing \
+         the arrow",
+        name.css_name()
+    ))
+}
+
+/// The double arrow for a resize from `edges`.
+fn resize_name(edges: Edges) -> CursorName {
     match (edges.top, edges.bottom, edges.left, edges.right) {
-        (true, _, true, _) | (_, true, _, true) => CursorKind::ResizeNwse,
-        (true, _, _, true) | (_, true, true, _) => CursorKind::ResizeNesw,
-        (true, _, _, _) | (_, true, _, _) => CursorKind::ResizeNs,
-        _ => CursorKind::ResizeEw,
+        (true, _, true, _) | (_, true, _, true) => CursorName::NwseResize,
+        (true, _, _, true) | (_, true, true, _) => CursorName::NeswResize,
+        (true, _, _, _) | (_, true, _, _) => CursorName::NsResize,
+        _ => CursorName::EwResize,
     }
 }
 
@@ -1059,5 +1106,79 @@ mod tests {
             windows: Vec::new(),
         };
         assert!(needs_frame(&all, &[]), "a window came or went");
+    }
+
+    fn edges(top: bool, bottom: bool, left: bool, right: bool) -> Edges {
+        Edges {
+            top,
+            bottom,
+            left,
+            right,
+        }
+    }
+
+    #[test]
+    fn the_shells_cursor_maps_to_its_image() {
+        use CursorName as N;
+        assert_eq!(
+            pointer_kind(CursorShape::Default),
+            Some(CursorKind::Shape(N::Default))
+        );
+        assert_eq!(
+            pointer_kind(CursorShape::Grabbing),
+            Some(CursorKind::Shape(N::Grabbing))
+        );
+        assert_eq!(
+            pointer_kind(CursorShape::Move),
+            Some(CursorKind::WindowMove)
+        );
+        assert_eq!(
+            pointer_kind(CursorShape::Named(N::ZoomIn)),
+            Some(CursorKind::Shape(N::ZoomIn))
+        );
+        assert_eq!(pointer_kind(CursorShape::Hidden), None);
+    }
+
+    #[test]
+    fn an_arrow_stand_in_is_reported_once_per_shape() {
+        use CursorName as N;
+        let mut noted = HashSet::new();
+        let copy = CursorKind::Shape(N::Copy);
+        assert_eq!(
+            arrow_stand_in_note(&mut noted, copy, true).as_deref(),
+            Some(
+                "an application asked for the copy pointer, which RubickWay has no image for: \
+                 showing the arrow"
+            )
+        );
+        assert_eq!(arrow_stand_in_note(&mut noted, copy, true), None, "once");
+        let ask = CursorKind::Shape(N::DndAsk);
+        assert!(arrow_stand_in_note(&mut noted, ask, true).is_some());
+        // A theme image, or a drawing of its own: nothing to say.
+        let alias = CursorKind::Shape(N::Alias);
+        assert_eq!(arrow_stand_in_note(&mut noted, alias, false), None);
+        assert!(arrow_stand_in_note(&mut noted, alias, true).is_some());
+    }
+
+    #[test]
+    fn resizes_show_the_double_arrow_of_their_axis() {
+        use CursorName as N;
+        let cases = [
+            (edges(true, false, true, false), N::NwseResize),
+            (edges(false, true, false, true), N::NwseResize),
+            (edges(true, false, false, true), N::NeswResize),
+            (edges(false, true, true, false), N::NeswResize),
+            (edges(true, false, false, false), N::NsResize),
+            (edges(false, true, false, false), N::NsResize),
+            (edges(false, false, true, false), N::EwResize),
+            (edges(false, false, false, true), N::EwResize),
+        ];
+        for (e, name) in cases {
+            assert_eq!(
+                pointer_kind(CursorShape::Resize(e)),
+                Some(CursorKind::Shape(name)),
+                "{e:?}"
+            );
+        }
     }
 }

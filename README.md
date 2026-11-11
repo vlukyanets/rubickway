@@ -69,6 +69,11 @@ on another GPU, for example with `prime-run`, shows its window as well. If that 
 its images to RubickWay, the log says so and applications draw in software through shared memory.
 Choosing which GPU RubickWay composes on is not there yet.
 
+Applications choose the pointer's shape over their windows: a resize arrow over a border, an
+I-beam over text, a pointing hand over a link. The images come from the cursor theme (see
+Configuration), and RubickWay draws its own where no theme is installed or the theme has none.
+Pointer images that applications draw themselves are not shown yet: they get the arrow.
+
 ## Configuration
 
 `~/.config/rubickway/config.kdl` (or `$XDG_CONFIG_HOME/rubickway/config.kdl`), in
@@ -133,8 +138,19 @@ distant-windows {
 }
 ```
 
-The full reference is in `specs/20261102-143401-drm-backend/contracts/config.md` and
-`specs/20261104-004828-gpu-buffers/contracts/config.md`.
+The cursor theme is the name of a directory under `~/.local/share/icons`, `~/.icons`,
+`/usr/share/icons` or `/usr/share/pixmaps`; without this block, the `default` theme is used. The
+log says when the theme is missing or has no image for some shapes:
+
+```kdl
+cursor {
+    theme "Adwaita"
+}
+```
+
+The full reference is in `specs/20261102-143401-drm-backend/contracts/config.md`,
+`specs/20261104-004828-gpu-buffers/contracts/config.md` and
+`specs/20261109-110128-cursor-shapes/contracts/config.md`.
 
 ## Controls
 

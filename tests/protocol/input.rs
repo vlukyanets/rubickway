@@ -4,7 +4,7 @@ use std::os::unix::fs::FileExt;
 
 use rubickway::canvas::{Point, Vector};
 use rubickway::input::{RawModifiers, ScrollSource};
-use rubickway::shell::{ClientInput, WindowEvent};
+use rubickway::shell::{AppCursor, ClientInput, CursorName, WindowEvent, WindowId};
 use wayland_client::Proxy;
 use wayland_client::WEnum;
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
@@ -331,6 +331,35 @@ fn a_disconnecting_focused_client_leaves_input_free() {
 
 // --- Standalone: applications hiding the pointer (FR-008) ------------------------------------
 
+/// Enters window `id` at (10, 10) and returns the serial of the `wl_pointer.enter` client `c` got.
+pub fn enter_pointer(h: &mut Harness, c: usize, id: WindowId) -> u32 {
+    h.c(c).clear_events();
+    h.server.deliver(
+        &[
+            ClientInput::PointerEnter {
+                window: id,
+                pos: Point::new(10.0, 10.0),
+            },
+            ClientInput::PointerFrame { window: id },
+        ],
+        1,
+    );
+    h.roundtrip();
+    h.c(c)
+        .events::<wl_pointer::Event>()
+        .iter()
+        .rev()
+        .find_map(|(_, e)| match e {
+            wl_pointer::Event::Enter { serial, .. } => Some(*serial),
+            _ => None,
+        })
+        .expect("an enter")
+}
+
+fn cursor_changed(id: WindowId, cursor: AppCursor) -> WindowEvent {
+    WindowEvent::CursorChanged { id, cursor }
+}
+
 #[test]
 fn set_cursor_without_a_surface_hides_the_pointer_over_the_clients_windows() {
     let mut h = Harness::new();
@@ -341,25 +370,74 @@ fn set_cursor_without_a_surface_hides_the_pointer_over_the_clients_windows() {
     let (_w, id) = open_window(&mut h, c, &g, 50, 50, RED);
     h.server.take_window_events();
 
-    pointer.set_cursor(0, None, 0, 0);
-    h.roundtrip();
-    let events = h.server.take_window_events();
-    assert!(
-        events.contains(&WindowEvent::CursorHidden { id, hidden: true }),
-        "{events:?}"
-    );
-
-    // Asking again changes nothing; a cursor image shows the pointer again.
+    // Before any enter: not counted (cursor-shapes research C2).
     pointer.set_cursor(0, None, 0, 0);
     h.roundtrip();
     assert!(h.server.take_window_events().is_empty());
-    let image = g.compositor.create_surface(&h.c(c).qh, ());
-    pointer.set_cursor(0, Some(&image), 0, 0);
+
+    let serial = enter_pointer(&mut h, c, id);
+    h.server.take_window_events();
+    pointer.set_cursor(serial, None, 0, 0);
     h.roundtrip();
-    assert!(
-        h.server
-            .take_window_events()
-            .contains(&WindowEvent::CursorHidden { id, hidden: false })
+    let events = h.server.take_window_events();
+    assert_eq!(events, vec![cursor_changed(id, AppCursor::Hidden)]);
+
+    // Asking again changes nothing; a cursor image shows the arrow again.
+    pointer.set_cursor(serial, None, 0, 0);
+    h.roundtrip();
+    assert!(h.server.take_window_events().is_empty());
+    let image = g.compositor.create_surface(&h.c(c).qh, ());
+    pointer.set_cursor(serial, Some(&image), 0, 0);
+    h.roundtrip();
+    assert_eq!(
+        h.server.take_window_events(),
+        vec![cursor_changed(id, AppCursor::Shape(CursorName::Default))]
     );
     assert!(!h.c(c).is_disconnected());
+}
+
+#[test]
+fn set_cursor_counts_only_with_the_latest_enter_serial_while_the_pointer_is_there() {
+    let mut h = Harness::new();
+    let c = h.connect();
+    let g = globals(h.c(c));
+    let seat: WlSeat = h.c(c).bind(8);
+    let pointer: WlPointer = seat.get_pointer(&h.c(c).qh, ());
+    let (_w, id) = open_window(&mut h, c, &g, 50, 50, RED);
+    let old = enter_pointer(&mut h, c, id);
+    let serial = enter_pointer(&mut h, c, id);
+    h.server.take_window_events();
+
+    // A stale or made-up serial: ignored.
+    pointer.set_cursor(old, None, 0, 0);
+    pointer.set_cursor(serial.wrapping_add(1), None, 0, 0);
+    h.roundtrip();
+    assert!(h.server.take_window_events().is_empty());
+
+    // Hidden, then a new enter: the arrow again until the application asks.
+    pointer.set_cursor(serial, None, 0, 0);
+    h.roundtrip();
+    assert_eq!(
+        h.server.take_window_events(),
+        vec![cursor_changed(id, AppCursor::Hidden)]
+    );
+    let serial = enter_pointer(&mut h, c, id);
+    assert_eq!(
+        h.server.take_window_events(),
+        vec![cursor_changed(id, AppCursor::Shape(CursorName::Default))]
+    );
+
+    // After the pointer left: ignored, even with the latest serial.
+    h.server
+        .deliver(&[ClientInput::PointerLeave { window: id }], 2);
+    h.roundtrip();
+    pointer.set_cursor(serial, None, 0, 0);
+    h.roundtrip();
+    assert!(h.server.take_window_events().is_empty());
+
+    // A surface with another role is still an error.
+    let (w2, _id2) = open_window(&mut h, c, &g, 20, 20, RED);
+    pointer.set_cursor(serial, Some(&w2.surface), 0, 0);
+    h.roundtrip();
+    assert!(h.c(c).is_disconnected());
 }

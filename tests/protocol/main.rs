@@ -6,6 +6,7 @@
 )]
 
 mod commits;
+mod cursor_shape;
 mod dmabuf;
 mod harness;
 mod input;

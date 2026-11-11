@@ -15,11 +15,12 @@ use wayland_server::protocol::wl_touch::WlTouch;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
 use super::compositor::{self, Role};
+use super::dmabuf::client_number;
 use super::{ServerState, xdg_shell};
 use crate::canvas::Point;
 use crate::ffi::shm_map::sealed_memfd;
 use crate::input::{RawModifiers, ScrollSource};
-use crate::shell::{ClientInput, WindowEvent, WindowId};
+use crate::shell::{AppCursor, ClientInput, CursorName, WindowEvent, WindowId};
 
 pub(crate) fn create_global(dh: &DisplayHandle) {
     dh.create_global::<ServerState, WlSeat, ()>(8, ());
@@ -46,9 +47,17 @@ pub(crate) struct SeatState {
     /// The keymap in a sealed memfd, and its size.
     keymap: Option<(File, u32)>,
     repeat: (i32, i32),
-    /// Clients that hid the pointer (`set_cursor` without a surface, FR-008).
-    hidden_cursor: Vec<ClientId>,
+    /// The window of `pointer_surface`.
+    pointer_window: Option<WindowId>,
+    /// The serial of the latest `wl_pointer.enter`: only the focused client's requests count,
+    /// so this is that client's latest enter serial (cursor-shapes research C2).
+    enter_serial: Option<u32>,
+    /// What the focused client asked for since that enter.
+    focus_cursor: AppCursor,
 }
+
+/// The cursor at each enter, until the client asks for something (cursor-shapes FR-003).
+const ENTER_CURSOR: AppCursor = AppCursor::Shape(CursorName::Default);
 
 impl Default for SeatState {
     fn default() -> Self {
@@ -64,39 +73,43 @@ impl Default for SeatState {
             modifiers: RawModifiers::default(),
             keymap: None,
             repeat: DEFAULT_REPEAT,
-            hidden_cursor: Vec::new(),
+            pointer_window: None,
+            enter_serial: None,
+            focus_cursor: ENTER_CURSOR,
         }
     }
 }
 
-/// A client hid the pointer or showed it again: tell the shell for each of its windows, once
-/// per change (FR-008).
-fn cursor_hidden(state: &mut ServerState, client: ClientId, hidden: bool) {
-    let before = state.seat.hidden_cursor.contains(&client);
-    if before == hidden {
-        return;
+/// A cursor request (`wl_pointer.set_cursor` or `wp_cursor_shape_device_v1.set_shape`) from
+/// `client`: it counts only while the pointer is over that client's surface and with the serial
+/// of the latest enter (cursor-shapes research C2); the shell hears of it only on a change.
+/// Returns whether it changed what is shown, for the caller's debug line.
+pub(crate) fn request_cursor(
+    state: &mut ServerState,
+    client: &ClientId,
+    serial: u32,
+    cursor: AppCursor,
+) -> bool {
+    let focused = state
+        .seat
+        .pointer_surface
+        .as_ref()
+        .and_then(|s| s.client())
+        .is_some_and(|c| c.id() == *client);
+    if !focused || state.seat.enter_serial != Some(serial) {
+        return false;
     }
-    if hidden {
-        state.seat.hidden_cursor.push(client.clone());
-    } else {
-        state.seat.hidden_cursor.retain(|c| *c != client);
+    let Some(window) = state.seat.pointer_window else {
+        return false;
+    };
+    if state.seat.focus_cursor == cursor {
+        return false;
     }
-    let windows: Vec<WindowId> = state
-        .windows
-        .iter()
-        .filter(|(_, root)| {
-            state
-                .surfaces
-                .get(*root)
-                .is_some_and(|s| s.client == client)
-        })
-        .map(|(id, _)| *id)
-        .collect();
-    for id in windows {
-        state
-            .window_events
-            .push(WindowEvent::CursorHidden { id, hidden });
-    }
+    state.seat.focus_cursor = cursor;
+    state
+        .window_events
+        .push(WindowEvent::CursorChanged { id: window, cursor });
+    true
 }
 
 fn same_client(resource: &impl Resource, surface: &WlSurface) -> bool {
@@ -154,12 +167,23 @@ fn relative_to(state: &ServerState, window: WindowId, surface: &WlSurface, pos: 
     Point::new(pos.x - at.x, pos.y - at.y)
 }
 
-fn pointer_enter(state: &mut ServerState, surface: WlSurface, local: Point) {
+fn pointer_enter(state: &mut ServerState, window: WindowId, surface: WlSurface, local: Point) {
     let serial = state.next_serial();
     for p in pointers_for(state, &surface) {
         p.enter(serial, &surface, local.x, local.y);
     }
     state.seat.pointer_surface = Some(surface);
+    state.seat.pointer_window = Some(window);
+    state.seat.enter_serial = Some(serial);
+    // The arrow until the client asks for something; the shell forgets its own copy when the
+    // pointer leaves a window, so it needs telling only within one window (a subsurface).
+    if state.seat.focus_cursor != ENTER_CURSOR {
+        state.seat.focus_cursor = ENTER_CURSOR;
+        state.window_events.push(WindowEvent::CursorChanged {
+            id: window,
+            cursor: ENTER_CURSOR,
+        });
+    }
 }
 
 fn pointer_leave(state: &mut ServerState) {
@@ -190,7 +214,7 @@ pub(crate) fn deliver(state: &mut ServerState, inputs: &[ClientInput], time_ms: 
             ClientInput::PointerEnter { window, pos } => {
                 pointer_leave(state);
                 if let Some((surface, local)) = surface_at(state, *window, *pos) {
-                    pointer_enter(state, surface, local);
+                    pointer_enter(state, *window, surface, local);
                 }
             }
             ClientInput::PointerMotion { window, pos } => {
@@ -207,7 +231,7 @@ pub(crate) fn deliver(state: &mut ServerState, inputs: &[ClientInput], time_ms: 
                     let buttons = std::mem::take(&mut state.seat.buttons_down);
                     pointer_leave(state);
                     state.seat.buttons_down = buttons;
-                    pointer_enter(state, surface, local);
+                    pointer_enter(state, *window, surface, local);
                 } else {
                     for p in pointers_for(state, &surface) {
                         p.motion(time_ms, local.x, local.y);
@@ -490,30 +514,37 @@ impl Dispatch<WlSeat, ()> for ServerState {
 impl Dispatch<WlPointer, ()> for ServerState {
     fn request(
         state: &mut Self,
-        _: &Client,
+        client: &Client,
         pointer: &WlPointer,
         request: wl_pointer::Request,
         _: &(),
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
-        // Cursor images are accepted but not shown; a cursor without a surface hides the pointer
-        // over the client's windows (FR-008, contracts/protocols.md "wl_pointer").
-        let wl_pointer::Request::SetCursor { surface, .. } = request else {
+        // Cursor images are accepted but not shown (the arrow is drawn); a cursor without a
+        // surface hides the pointer over the client's windows (FR-008, cursor-shapes
+        // contracts/protocols.md "wl_pointer").
+        let wl_pointer::Request::SetCursor {
+            serial, surface, ..
+        } = request
+        else {
             return;
         };
-        let Some(client) = pointer.client().map(|c| c.id()) else {
-            return;
-        };
-        match surface {
+        let (cursor, what) = match surface {
             Some(surface) => {
                 if !compositor::set_role(state, &surface.id(), Role::Cursor) {
                     pointer.post_error(wl_pointer::Error::Role, "the surface already has a role");
                     return;
                 }
-                cursor_hidden(state, client, false);
+                (
+                    ENTER_CURSOR,
+                    "shows its own pointer image (the arrow is drawn)",
+                )
             }
-            None => cursor_hidden(state, client, true),
+            None => (AppCursor::Hidden, "hides the pointer"),
+        };
+        if request_cursor(state, &client.id(), serial, cursor) {
+            tracing::debug!("application {} {what}", client_number(client));
         }
     }
 

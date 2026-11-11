@@ -14,6 +14,7 @@ use crate::input::bindings::{
     Bindings, KeyCombo, ModKey, PointerAction, PointerBind, PointerCombo, SpawnBind,
 };
 use crate::input::{Button, Keysym, Modifiers};
+use crate::render::cursor::valid_theme_name;
 
 /// The settings read at startup (FR-024).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub struct Config {
     pub watchdog_timeout: Duration,
     /// Less work for distant windows (FR-017); nothing set by default.
     pub distant_windows: DistantWindows,
+    /// The cursor theme for pointer images (cursor-shapes FR-010); `None`: the `default` theme.
+    pub cursor_theme: Option<String>,
 }
 
 impl Default for Config {
@@ -39,6 +42,7 @@ impl Default for Config {
             pointer: default_pointer(),
             watchdog_timeout: Duration::from_secs(10),
             distant_windows: DistantWindows::default(),
+            cursor_theme: None,
         }
     }
 }
@@ -450,6 +454,7 @@ impl Parser<'_> {
                 "binds" => self.binds(node),
                 "watchdog-timeout-sec" => self.watchdog(node),
                 "distant-windows" => self.distant_windows(node),
+                "cursor" => self.cursor(node),
                 other => self.warn(node, format!("unknown setting `{other}`, ignored")),
             }
         }
@@ -654,6 +659,35 @@ impl Parser<'_> {
             );
         }
         self.config.distant_windows = distant;
+    }
+
+    /// `cursor { theme "<name>" }` (cursor-shapes FR-010, research C11).
+    fn cursor(&mut self, node: &KdlNode) {
+        let Some(children) = self.block(node) else {
+            return;
+        };
+        for child in self.each(children) {
+            match child.name().value() {
+                "theme" => {
+                    let Some(name) = self.one_string(child) else {
+                        continue;
+                    };
+                    if valid_theme_name(&name) {
+                        self.config.cursor_theme = Some(name);
+                    } else {
+                        self.warn(
+                            child,
+                            "`theme` expects the name of a cursor theme: not empty, `.` or `..`, \
+                             and without `/`",
+                        );
+                    }
+                }
+                other => self.warn(
+                    child,
+                    format!("unknown setting `cursor > {other}`, ignored"),
+                ),
+            }
+        }
     }
 
     /// The single whole number argument of a leaf node, from `low` to `high`.
