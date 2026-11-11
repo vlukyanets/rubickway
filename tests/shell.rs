@@ -11,8 +11,8 @@ use rubickway::input::bindings::{
 };
 use rubickway::input::{Button, InputEvent, Keysym, Modifiers, RawModifiers, ScrollSource};
 use rubickway::shell::{
-    ClientInput, CursorShape, Edges, Mode, Shell, SizeLimits, States, WindowCommand, WindowEvent,
-    WindowId,
+    AppCursor, ClientInput, CursorName, CursorShape, Edges, Mode, Shell, SizeLimits, States,
+    WindowCommand, WindowEvent, WindowId,
 };
 
 fn full(size: Size) -> Vec<Rect> {
@@ -2440,33 +2440,169 @@ fn after_resuming_focus_returns_and_the_pointer_re_enters() {
 
 // --- User Story 2: applications hiding the pointer (FR-008) ----------------------------------
 
+fn app_cursor(n: u64, cursor: AppCursor) -> WindowEvent {
+    WindowEvent::CursorChanged { id: w(n), cursor }
+}
+
+fn named(n: u64, name: CursorName) -> WindowEvent {
+    app_cursor(n, AppCursor::Shape(name))
+}
+
 #[test]
 fn the_pointer_is_hidden_only_over_a_window_that_hid_it_and_without_a_gesture() {
     let mut s = shell_with_window();
-    // Window 1 (200x100) covers logical (400..600, 350..450); window 2 opens there too, on top,
-    // and is moved away so the two do not overlap.
-    s.apply(WindowEvent::CursorHidden {
-        id: w(1),
-        hidden: true,
-    });
+    // Window 1 (200x100) covers logical (400..600, 350..450).
     motion(&mut s, 500.0, 400.0);
+    s.apply(app_cursor(1, AppCursor::Hidden));
     assert_eq!(s.cursor(), CursorShape::Hidden);
     // A compositor gesture shows its own shape: Mod+Shift + left drag pans everywhere.
     mods(&mut s, super_shift(), 65);
     left(&mut s, true);
     assert_eq!(s.cursor(), CursorShape::Grabbing);
-    left(&mut s, false);
+    let out = left(&mut s, false);
     mods(&mut s, Modifiers::NONE, 0);
+    // The pan ends over the window: it is entered again, and shows the arrow until its
+    // application asks again (cursor-shapes FR-003, FR-005).
+    assert!(
+        out.iter()
+            .any(|i| matches!(i, ClientInput::PointerEnter { window, .. } if *window == w(1))),
+        "{out:?}"
+    );
+    assert_eq!(s.cursor(), CursorShape::Default);
+    s.apply(app_cursor(1, AppCursor::Hidden));
+    assert_eq!(s.cursor(), CursorShape::Hidden);
     // Over the background: the default arrow.
     motion(&mut s, 10.0, 10.0);
     assert_eq!(s.cursor(), CursorShape::Default);
-    // Shown again when the application asks for a cursor image.
-    s.apply(WindowEvent::CursorHidden {
-        id: w(1),
-        hidden: false,
-    });
+    // Shown again when the application asks for a cursor image (the arrow).
+    motion(&mut s, 500.0, 400.0);
+    s.apply(named(1, CursorName::Default));
+    assert_eq!(s.cursor(), CursorShape::Named(CursorName::Default));
+}
+
+// --- Cursor shapes (cursor-shapes FR-002 - FR-005, research C3) ------------------------------
+
+#[test]
+fn a_named_shape_shows_only_over_the_window_that_named_it() {
+    let mut s = shell_with_window();
+    motion(&mut s, 500.0, 400.0);
+    s.apply(named(1, CursorName::Text));
+    assert_eq!(s.cursor(), CursorShape::Named(CursorName::Text));
+    // An event for a window that is not entered changes nothing.
+    s.apply(named(2, CursorName::Pointer));
+    assert_eq!(s.cursor(), CursorShape::Named(CursorName::Text));
+    // The background: the arrow.
+    motion(&mut s, 10.0, 10.0);
+    assert_eq!(s.cursor(), CursorShape::Default);
+    // Back over the window without a new event: the arrow until it names a shape again.
     motion(&mut s, 500.0, 400.0);
     assert_eq!(s.cursor(), CursorShape::Default);
+    s.apply(named(1, CursorName::EResize));
+    assert_eq!(s.cursor(), CursorShape::Named(CursorName::EResize));
+}
+
+#[test]
+fn a_named_shape_is_not_carried_to_another_window() {
+    let mut s = shell_with_window();
+    // Window 2 (100x50) opens centred on top of window 1, covering (450..550, 375..425).
+    s.apply(mapped(2, 100.0, 50.0));
+    motion(&mut s, 410.0, 360.0); // window 1 only
+    s.apply(named(1, CursorName::Text));
+    motion(&mut s, 500.0, 400.0); // window 2
+    assert_eq!(s.cursor(), CursorShape::Default);
+    s.apply(named(2, CursorName::Pointer));
+    assert_eq!(s.cursor(), CursorShape::Named(CursorName::Pointer));
+}
+
+#[test]
+fn gestures_show_their_own_images_over_a_named_window_and_enter_it_again_after() {
+    let mut s = shell_with_window();
+    motion(&mut s, 410.0, 360.0);
+    s.apply(named(1, CursorName::Text));
+    // Move (Mod + left).
+    let out = start_move(&mut s, 410.0, 360.0);
+    assert!(
+        out.contains(&ClientInput::PointerLeave { window: w(1) }),
+        "{out:?}"
+    );
+    assert_eq!(s.cursor(), CursorShape::Move);
+    // A request the server would not pass on now: the window has no pointer, but an event
+    // that arrives anyway is ignored.
+    s.apply(named(1, CursorName::Wait));
+    assert_eq!(s.cursor(), CursorShape::Move);
+    let out = left(&mut s, false);
+    mods(&mut s, Modifiers::NONE, 0);
+    assert!(
+        out.iter()
+            .any(|i| matches!(i, ClientInput::PointerEnter { window, .. } if *window == w(1))),
+        "{out:?}"
+    );
+    assert_eq!(s.cursor(), CursorShape::Default);
+    s.apply(named(1, CursorName::Text));
+    assert_eq!(s.cursor(), CursorShape::Named(CursorName::Text));
+    // Resize (Mod + right) from the bottom-right quarter.
+    motion(&mut s, 590.0, 440.0);
+    mods(&mut s, super_mod(), 64);
+    button(&mut s, Button::Right, BTN_RIGHT, true);
+    assert!(
+        matches!(s.cursor(), CursorShape::Resize(_)),
+        "{:?}",
+        s.cursor()
+    );
+    button(&mut s, Button::Right, BTN_RIGHT, false);
+    mods(&mut s, Modifiers::NONE, 0);
+    assert_eq!(s.cursor(), CursorShape::Default);
+}
+
+#[test]
+fn unmapping_the_window_under_the_pointer_forgets_its_shape() {
+    let mut s = shell_with_window();
+    s.apply(mapped(2, 100.0, 50.0));
+    motion(&mut s, 500.0, 400.0); // window 2, on top of window 1
+    s.apply(named(2, CursorName::Text));
+    s.apply(WindowEvent::Unmapped { id: w(2) });
+    motion(&mut s, 501.0, 400.0); // now over window 1
+    assert_eq!(s.cursor(), CursorShape::Default);
+}
+
+#[test]
+fn unmapping_the_window_under_the_pointer_enters_the_one_below_without_motion() {
+    let mut s = shell_with_window();
+    s.apply(mapped(2, 100.0, 50.0));
+    motion(&mut s, 500.0, 400.0); // window 2, on top of window 1
+    s.apply(named(2, CursorName::Text));
+    let out = s.apply(WindowEvent::Unmapped { id: w(2) });
+    assert!(
+        out.iter().any(|i| matches!(
+            i,
+            ClientInput::PointerEnter { window, .. } if *window == w(1)
+        )),
+        "{out:?}"
+    );
+    assert_eq!(s.cursor(), CursorShape::Default);
+    // Window 1 names its shape in answer to the enter, with the pointer still.
+    s.apply(named(1, CursorName::Text));
+    assert_eq!(s.cursor(), CursorShape::Named(CursorName::Text));
+}
+
+#[test]
+fn crossing_displays_over_the_same_window_keeps_its_shape() {
+    let mut s = two_viewers();
+    // Centred in A at canvas (-500, 0), 1400 wide: it covers canvas x -1200..200, on both.
+    s.apply(mapped(1, 1400.0, 100.0));
+    moved(&mut s, 400.0, 0.0); // A's screen (900, 400): canvas (-100, 0)
+    s.apply(named(1, CursorName::Text));
+    assert_eq!(s.cursor(), CursorShape::Named(CursorName::Text));
+    let out = moved(&mut s, 200.0, 0.0); // B's screen (100, 400): canvas (100, 0)
+    assert_eq!(s.active(), Some(B));
+    assert!(
+        !out.iter().any(|i| matches!(
+            i,
+            ClientInput::PointerLeave { .. } | ClientInput::PointerEnter { .. }
+        )),
+        "{out:?}"
+    );
+    assert_eq!(s.cursor(), CursorShape::Named(CursorName::Text));
 }
 
 // --- User Story 3: every monitor is a viewer (FR-018 - FR-023, research S14) -----------------

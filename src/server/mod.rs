@@ -7,6 +7,7 @@
 
 mod commit_queue;
 mod compositor;
+mod cursor_shape;
 mod data_device;
 mod descriptors;
 mod dmabuf;
@@ -252,6 +253,7 @@ impl Server {
         shm::create_global(&dh);
         xdg_shell::create_global(&dh);
         seat::create_global(&dh);
+        cursor_shape::create_global(&dh);
         data_device::create_global(&dh);
         viewporter::create_globals(&dh);
         Ok(Server {

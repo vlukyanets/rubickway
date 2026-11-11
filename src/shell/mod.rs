@@ -9,10 +9,12 @@
 //! Mod + right resizes a window, Mod+Shift + left pans), Mod+Tab cycles focus, everything else
 //! goes to the window under the pointer or with keyboard focus, as [`ClientInput`]s. Maximize and fullscreen are decided here too (research W7, W8).
 
+mod cursor;
 mod geometry;
 mod route;
 mod windows;
 
+pub use cursor::{AppCursor, CursorName};
 pub use geometry::*;
 pub use route::ClientInput;
 pub use windows::*;
@@ -79,9 +81,9 @@ pub enum WindowEvent {
         on: bool,
         output: Option<ViewerId>,
     },
-    /// The application hid the pointer over its windows (`wl_pointer.set_cursor` without a
-    /// surface) or showed it again (FR-008).
-    CursorHidden { id: WindowId, hidden: bool },
+    /// The cursor the application of window `id` asks for while the pointer is over it, sent
+    /// only when it changes (cursor-shapes research C3). Ignored unless the pointer is in `id`.
+    CursorChanged { id: WindowId, cursor: AppCursor },
 }
 
 /// States the shell asks a window to have (`activated` follows keyboard focus).
@@ -115,6 +117,9 @@ pub enum CursorShape {
     Move,
     /// An interactive resize from these edges.
     Resize(Edges),
+    /// The shape the application under the pointer named, and no gesture runs (cursor-shapes
+    /// FR-002).
+    Named(CursorName),
     /// No pointer: the application under it hid it, and no gesture runs (FR-008).
     Hidden,
 }
@@ -158,8 +163,9 @@ pub struct Shell {
     maximized_on: Vec<(WindowId, ViewerId)>,
     /// Initial states answered at `Created`, entered at `Mapped` (research W13).
     initial: Vec<Initial>,
-    /// Windows whose application hid the pointer (FR-008).
-    cursor_hidden: Vec<WindowId>,
+    /// The cursor the application of the entered window asked for since the pointer entered
+    /// it (cursor-shapes research C3); forgotten when the pointer leaves that window.
+    app_cursor: Option<(WindowId, AppCursor)>,
     dirty: bool,
 }
 
@@ -228,7 +234,7 @@ impl Shell {
             },
             maximized_on: Vec::new(),
             initial: Vec::new(),
-            cursor_hidden: Vec::new(),
+            app_cursor: None,
             dirty: true,
         }
     }
@@ -326,14 +332,13 @@ impl Shell {
                 ..
             }) => CursorShape::Resize(*edges),
             None if self.av().is_panning() => CursorShape::Grabbing,
-            None if self
-                .router
-                .entered
-                .is_some_and(|w| self.cursor_hidden.contains(&w)) =>
-            {
-                CursorShape::Hidden
-            }
-            None => CursorShape::Default,
+            None => match self.app_cursor {
+                Some((w, cursor)) if self.router.entered == Some(w) => match cursor {
+                    AppCursor::Shape(name) => CursorShape::Named(name),
+                    AppCursor::Hidden => CursorShape::Hidden,
+                },
+                _ => CursorShape::Default,
+            },
         }
     }
 
@@ -609,17 +614,16 @@ impl Shell {
                 }
             }
             WindowEvent::MaximizeRequested { .. } | WindowEvent::FullscreenRequested { .. } => {}
-            WindowEvent::CursorHidden { id, hidden } => {
-                let before = self.cursor_hidden.contains(&id);
-                if hidden && !before {
-                    self.cursor_hidden.push(id);
-                } else if !hidden {
-                    self.cursor_hidden.retain(|w| *w != id);
+            WindowEvent::CursorChanged { id, cursor } => {
+                if self.router.entered == Some(id) && self.router.operation.is_none() {
+                    self.app_cursor = Some((id, cursor));
                 }
             }
             WindowEvent::Unmapped { id } => {
                 self.windows.unmap(id);
-                self.cursor_hidden.retain(|w| *w != id);
+                if self.app_cursor.is_some_and(|(w, _)| w == id) {
+                    self.app_cursor = None;
+                }
                 self.settling.retain(|w| *w != id);
                 self.initial.retain(|i| i.window != id);
                 self.maximized_on.retain(|(w, _)| *w != id);
@@ -643,6 +647,11 @@ impl Shell {
                 }
                 if self.router.entered == Some(id) {
                     self.router.entered = None;
+                    // The window now under the pointer gets its enter at once, so it can name
+                    // its shape without waiting for a motion (US3 scenario 4).
+                    if let Some(p) = self.pointer_canvas() {
+                        self.retarget(p, false, &mut out);
+                    }
                 }
                 if before == Some(id) {
                     // Keys held for it are forgotten (misbehaving case 3).
@@ -1555,6 +1564,7 @@ impl Shell {
     }
 
     fn leave(&mut self, out: &mut Vec<ClientInput>) {
+        self.app_cursor = None;
         if let Some(window) = self.router.entered.take() {
             out.push(ClientInput::PointerLeave { window });
             out.push(ClientInput::PointerFrame { window });
