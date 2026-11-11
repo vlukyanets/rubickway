@@ -216,7 +216,7 @@ built-in images and log lines for whatever it lacks.
   - this feature's `contracts/config.md` in the reference list.
 - [X] T030 [P] Compare the log lines in code with contracts/cli.md, and the protocol behaviour with contracts/protocols.md. Update the contracts first if anything had to differ. (2026-11-09: contracts/cli.md gained the line for a missing configured theme when `default` has no images, and the note that the info line follows the "not installed" warning.)
 - [X] T031 Run the full check from `AGENTS.md`, debug and release. (2026-11-09: 628 passed in each, clippy clean.)
-- [ ] T032 Record the quickstart results (Q1-Q14) in this file. Mention in the PR body that it also carries the `drm >=0.15` Dependabot ignore rule in `.github/dependabot.yml`. (2026-11-11, results recorded; the PR body is still to come. On the laptop, owner:
+- [X] T032 Record the quickstart results (Q1-Q14) in this file. Mention in the PR body that it also carries the `drm >=0.15` Dependabot ignore rule in `.github/dependabot.yml`. (2026-11-11, results recorded; the PR body (#8) mentions the rule. On the laptop, owner:
   - **Passed**: Q1-Q4, Q6, Q6a, Q7-Q9, Q11-Q14.
   - **Not run**: Q5, no second monitor at hand (its automated part is `crossing_displays_over_the_same_window_keeps_its_shape`); Q10, no GTK 4 or Qt 6 program installed.
   - **Fixed on the way**: Q6a's test program opened its picture file write-only, so the server could not map it (`wl_shm` "cannot map the pool: Permission denied"); Q13, see T028; the Q9 expected line in quickstart.md named the wrong one of the two contracts/cli.md lines for the laptop, where `default` still exists.)
