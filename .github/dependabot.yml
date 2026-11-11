@@ -14,6 +14,11 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
+    ignore:
+      # gbm 0.18 is built against drm 0.14 and its buffers must be the same type: bump drm
+      # together with a gbm built on the newer drm, then drop this rule.
+      - dependency-name: drm
+        versions: [">=0.15"]
     open-pull-requests-limit: 5
 
   - package-ecosystem: github-actions
