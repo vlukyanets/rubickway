@@ -22,8 +22,6 @@ driving the displays, or into shared memory.
   `libglvnd`, `libxkbcommon`, `xkeyboard-config`. On Debian/Ubuntu: `libinput-dev`,
   `libseat-dev`, `libgbm-dev`, `libudev-dev`, `libxkbcommon-dev`, `libegl-dev`,
   `libgles-dev`, `libegl-mesa0`, `xkb-data`.
-- [kitty](https://sw.kovidgoyal.net/kitty/), the terminal Mod+Return starts, and a scalable
-  monospace font for it, such as `ttf-dejavu` (kitty does not start with bitmap fonts only).
 
 ## Setup, run, test
 
