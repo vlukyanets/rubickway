@@ -1,8 +1,4 @@
 //! A panic ends RubickWay with one line and status 1, in a child process (FR-017, S20).
-#![expect(
-    clippy::expect_used,
-    reason = "the helper that starts the child process fails the test when it cannot"
-)]
 
 use std::process::{Command, ExitCode};
 

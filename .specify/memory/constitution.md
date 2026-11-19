@@ -121,7 +121,7 @@ plugins together with the core is the only reliable way to load Rust code at run
 
 ## Technical Constraints
 
-- Language: Rust 1.99, edition 2024, with the toolchain pinned in the repository.
+- Language: Rust 1.100, edition 2024, with the toolchain pinned in the repository.
 - Delivery: a `rubickway` binary plus optional plugin libraries. It runs standalone on the
   hardware (DRM/KMS), started from a text console (TTY); there is no nested mode inside
   another Wayland session.
@@ -154,4 +154,4 @@ plugins together with the core is the only reliable way to load Rust code at run
   still settling; 1.0.0 marks the first version the owner declares stable.
 - Reviews of specs, plans and code MUST check compliance with these principles.
 
-**Version**: 0.2.0 | **Ratified**: 2026-11-01 | **Last Amended**: 2026-11-02
+**Version**: 0.2.0 | **Ratified**: 2026-11-01 | **Last Amended**: 2026-11-19

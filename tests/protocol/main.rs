@@ -1,9 +1,4 @@
 //! Protocol tests: the real server, in-process, with `wayland-client` test clients.
-#![expect(
-    clippy::expect_used,
-    clippy::panic,
-    reason = "test harness helpers fail loudly; clippy.toml only exempts #[test] functions"
-)]
 
 mod commits;
 mod cursor_shape;

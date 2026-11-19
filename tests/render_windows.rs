@@ -1,10 +1,6 @@
 //! Rendering tests for windows: offscreen on llvmpipe, read back, checked against pixel facts
 //! (constitution III, FR-005). Window rectangles are given in physical pixels here; the
 //! canvas-to-screen math is tested in the shell and viewer tests.
-#![expect(
-    clippy::panic,
-    reason = "the render helper fails loudly; clippy.toml only exempts #[test] functions"
-)]
 
 use std::sync::Mutex;
 

@@ -1,10 +1,6 @@
 //! Rendering tests: the grid is rendered offscreen on Mesa's software rasteriser (llvmpipe),
 //! read back, and checked against pixel facts computed from the inputs (constitution III).
 //! No reference images are stored.
-#![expect(
-    clippy::panic,
-    reason = "the render helper fails loudly; clippy.toml only exempts #[test] functions"
-)]
 
 use std::sync::Mutex;
 
