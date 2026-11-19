@@ -1,8 +1,4 @@
 //! The shell: window events from the server, visibility, input routing and window management.
-#![expect(
-    clippy::unwrap_used,
-    reason = "test helpers look up windows the test just mapped; clippy.toml only exempts #[test] functions"
-)]
 
 use proptest::prelude::*;
 use rubickway::canvas::{Camera, Point, Rect, Size, Vector, ViewerId};

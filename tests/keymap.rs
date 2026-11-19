@@ -1,8 +1,4 @@
 //! Keyboard translation with real xkb keymaps, compiled from RMLVO names.
-#![expect(
-    clippy::expect_used,
-    reason = "test setup helpers fail loudly; clippy.toml only exempts #[test] functions"
-)]
 
 use rubickway::input::bindings::{Action, Bindings};
 use rubickway::input::keyboard::Keyboard;

@@ -2,10 +2,6 @@
 //! picture drawn as a shared-memory window (FR-004). External textures here are made from ordinary
 //! textures, so no dma-buf and no device is needed (research G11); real imports are in the
 //! quickstart.
-#![expect(
-    clippy::expect_used,
-    reason = "the render helpers fail loudly; clippy.toml only exempts #[test] functions"
-)]
 
 use std::sync::Mutex;
 

@@ -13,7 +13,7 @@ driving the displays, or into shared memory.
 
 ## Prerequisites
 
-- [rustup](https://rustup.rs/) - the toolchain (Rust 1.99) is pinned in
+- [rustup](https://rustup.rs/) - the toolchain (Rust 1.100) is pinned in
   `rust-toolchain.toml` and installed automatically.
 - Linux with a graphics card that supports atomic modesetting, and a login session from
   logind (systemd) or seatd.

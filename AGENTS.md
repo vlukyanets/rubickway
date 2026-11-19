@@ -13,7 +13,7 @@ add only tool-specific extras.
 
 **RubickWay** - a Wayland compositor with an endless canvas where every monitor is a viewer.
 
-- Stack: Rust 1.99, edition 2024 (pinned in `rust-toolchain.toml`), cargo. No database.
+- Stack: Rust 1.100, edition 2024 (pinned in `rust-toolchain.toml`), cargo. No database.
   Dependencies are added per feature; which crates are allowed is in the constitution
   (Principle I).
 
@@ -113,9 +113,10 @@ itself is the point (user-facing copy that needs it, tests for Unicode handling)
 
 ## Gotchas
 
-- **Lint exceptions**: `unwrap`/`expect`/`panic!` are allowed in `#[test]` functions via
-  `clippy.toml`, but not in helper functions of integration tests - those crates declare a
-  crate-level `#![expect(..., reason = "...")]`. Elsewhere use
+- **Lint exceptions**: `unwrap`/`expect`/`panic!` are allowed in test code via `clippy.toml`:
+  `#[test]` functions and, since clippy 1.100, every function of an integration test crate
+  (`tests/`), helpers included - so those crates need no `#![expect]` for them (an unfulfilled
+  expectation is an error). Elsewhere use
   `#[expect(clippy::unwrap_used, reason = "...")]`, never `#[allow(clippy::...)]`. A module
   that needs `unsafe` opts in with `#![allow(unsafe_code)]`, and only FFI (`src/ffi/`),
   backend, render and plugin loader modules may (constitution, Principle V).
