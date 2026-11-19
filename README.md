@@ -74,6 +74,12 @@ I-beam over text, a pointing hand over a link. The images come from the cursor t
 Configuration), and RubickWay draws its own where no theme is installed or the theme has none.
 Pointer images that applications draw themselves are not shown yet: they get the arrow.
 
+Menus, dropdown lists, submenus and tooltips open next to their window, at the window's zoom,
+and are kept inside the display the pointer is on. While a menu is open, a click outside its
+application closes it and goes no further, as in GNOME or KDE; a click on the application's own
+windows reaches them. Any RubickWay action closes all open menus first: a shortcut, moving or
+resizing a window, panning or zooming, focus moving to another window, maximize or fullscreen.
+
 ## Configuration
 
 `~/.config/rubickway/config.kdl` (or `$XDG_CONFIG_HOME/rubickway/config.kdl`), in

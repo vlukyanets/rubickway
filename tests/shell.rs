@@ -11,14 +11,15 @@ use rubickway::input::bindings::{
 };
 use rubickway::input::{Button, InputEvent, Keysym, Modifiers, RawModifiers, ScrollSource};
 use rubickway::shell::{
-    AppCursor, ClientInput, CursorName, CursorShape, Edges, Mode, Shell, SizeLimits, States,
-    WindowCommand, WindowEvent, WindowId,
+    Adjust, Anchor8, AppCursor, AppId, ClientInput, CursorName, CursorShape, Edges, IRect, Mode,
+    PopupId, PopupRules, Shell, SizeLimits, States, WindowCommand, WindowEvent, WindowId, place,
 };
 
 fn full(size: Size) -> Vec<Rect> {
     vec![Rect::new(Point::new(0.0, 0.0), size)]
 }
 
+/// Window `n` of application `n` (each window its own application unless a test says otherwise).
 fn mapped(n: u64, w: f64, h: f64) -> WindowEvent {
     let size = Size::new(w, h);
     WindowEvent::Mapped {
@@ -27,6 +28,7 @@ fn mapped(n: u64, w: f64, h: f64) -> WindowEvent {
         input: full(size),
         limits: SizeLimits::default(),
         parent: None,
+        app: AppId(n),
     }
 }
 
@@ -330,6 +332,7 @@ fn a_press_outside_the_input_region_falls_through() {
         input: vec![Rect::new(Point::new(0.0, 0.0), Size::new(100.0, 100.0))],
         limits: SizeLimits::default(),
         parent: None,
+        app: AppId(2),
     });
     motion(&mut s, 550.0, 400.0); // right half: window 1 below
     let out = left(&mut s, true);
@@ -1609,6 +1612,7 @@ fn mapped_with_parent(n: u64, size: Size, parent: Option<u64>) -> WindowEvent {
         input: full(size),
         limits: SizeLimits::default(),
         parent: parent.map(w),
+        app: AppId(n),
     }
 }
 
@@ -1878,7 +1882,7 @@ fn configures(cmds: &[WindowCommand]) -> Vec<(WindowId, Option<Size>, States)> {
                 size,
                 states,
             } => Some((*window, *size, *states)),
-            WindowCommand::Close { .. } => None,
+            _ => None,
         })
         .collect()
 }
@@ -2038,6 +2042,7 @@ fn resizes_respect_the_size_limits_and_the_largest_window() {
             max: Size::new(0.0, 120.0),
         },
         parent: None,
+        app: AppId(1),
     });
     s.set_largest_window(Size::new(260.0, 4096.0));
     start_resize(&mut s, 590.0, 440.0);
@@ -3123,4 +3128,927 @@ fn a_bound_pan_with_a_fullscreen_window_leaves_fullscreen() {
     assert_eq!(s.fullscreen(), None);
     assert_eq!(s.cursor(), CursorShape::Default, "consumed, no pan");
     middle(&mut s, false);
+}
+
+// --- popups (popups tasks T015) ---------------------------------------------------------------
+
+fn p(n: u64) -> PopupId {
+    PopupId(n)
+}
+
+/// Rules that put a `size` popup with its top-left at `at` (parent coordinates), every
+/// adjustment allowed.
+fn menu_rules(at: (i32, i32), size: (i32, i32)) -> PopupRules {
+    PopupRules {
+        size,
+        anchor_rect: IRect::new(at.0, at.1, 0, 0),
+        anchor: Anchor8::BottomRight,
+        gravity: Anchor8::BottomRight,
+        adjust: Adjust::ALL,
+        ..PopupRules::default()
+    }
+}
+
+fn requested(
+    n: u64,
+    window: u64,
+    parent: Option<u64>,
+    rules: PopupRules,
+    grab: bool,
+) -> WindowEvent {
+    WindowEvent::PopupRequested {
+        id: p(n),
+        window: w(window),
+        parent: parent.map(p),
+        rules,
+        grab,
+    }
+}
+
+fn placements(cmds: &[WindowCommand]) -> Vec<(PopupId, IRect, Option<u32>)> {
+    cmds.iter()
+        .filter_map(|c| match c {
+            WindowCommand::PlacePopup { id, at, token } => Some((*id, *at, *token)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn dismissals(cmds: &[WindowCommand]) -> Vec<PopupId> {
+    cmds.iter()
+        .filter_map(|c| match c {
+            WindowCommand::DismissPopup { id } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Asks for popup `n` on `window` (or on popup `parent`), answers its placement as the
+/// application would, and shows it. Returns the input from showing it.
+fn open_popup(
+    s: &mut Shell,
+    n: u64,
+    window: u64,
+    parent: Option<u64>,
+    rules: PopupRules,
+    grab: bool,
+) -> Vec<ClientInput> {
+    s.apply(requested(n, window, parent, rules, grab));
+    let placed = placements(&s.take_commands());
+    let (_, at, _) = placed
+        .iter()
+        .find(|(id, _, _)| *id == p(n))
+        .copied()
+        .unwrap();
+    let size = Size::new(f64::from(at.w), f64::from(at.h));
+    s.apply(WindowEvent::PopupMapped {
+        id: p(n),
+        at: (at.x, at.y),
+        size,
+        input: full(size),
+    })
+}
+
+fn mapped_app(n: u64, width: f64, height: f64, app: u64) -> WindowEvent {
+    let size = Size::new(width, height);
+    WindowEvent::Mapped {
+        id: w(n),
+        size,
+        input: full(size),
+        limits: SizeLimits::default(),
+        parent: None,
+        app: AppId(app),
+    }
+}
+
+/// Window 1 (200x100, application 1) at the view centre, focused, and window `n` (100x50, of
+/// application `app`) at canvas (300, 0), on screen around (800, 400). The view is back at the
+/// origin and the pointer is over window 1.
+fn shell_with_far_window(n: u64, app: u64) -> Shell {
+    let mut s = shell_with_window();
+    s.viewer_mut().set_camera(camera_at(300.0, 0.0, 1.0));
+    s.apply(mapped_app(n, 100.0, 50.0, app));
+    s.viewer_mut().set_camera(camera_at(0.0, 0.0, 1.0));
+    motion(&mut s, 500.0, 400.0);
+    left(&mut s, true);
+    left(&mut s, false);
+    s.take_commands();
+    s
+}
+
+fn has_popup_keyboard(out: &[ClientInput], window: u64, popup: Option<u64>) -> bool {
+    out.contains(&ClientInput::PopupKeyboard {
+        window: w(window),
+        popup: popup.map(p),
+    })
+}
+
+#[test]
+fn a_popup_is_placed_against_the_view_and_becomes_part_of_its_window() {
+    let mut s = shell_with_window();
+    // Window 1 starts at canvas (-100, -50); the view is (-500, -400) .. (500, 400), so in the
+    // window's coordinates the area is (-400, -350) .. (600, 450). A 450-wide menu at x 190
+    // would end at 640: it flips to the left of its anchor.
+    let rules = menu_rules((190, 90), (450, 100));
+    s.apply(requested(1, 1, None, rules, false));
+    let expected = place(&rules, Some(IRect::new(-400, -350, 1000, 800)));
+    assert_eq!(expected, IRect::new(-260, 90, 450, 100));
+    assert_eq!(placements(&s.take_commands()), vec![(p(1), expected, None)]);
+    s.take_dirty();
+    let size = Size::new(450.0, 100.0);
+    s.apply(WindowEvent::PopupMapped {
+        id: p(1),
+        at: (-260, 90),
+        size,
+        input: full(size),
+    });
+    assert!(s.take_dirty());
+    let win = s.windows().get(w(1)).unwrap();
+    assert_eq!(win.popups.len(), 1);
+    assert!(win.popup(p(1)).unwrap().shown.is_some());
+}
+
+#[test]
+fn a_window_whose_popup_alone_is_in_view_is_visible() {
+    let mut s = shell_with_window();
+    // A 100x40 popup at window (190, 90): canvas (90, 40) .. (190, 80).
+    open_popup(&mut s, 1, 1, None, menu_rules((190, 90), (100, 40)), false);
+    // The view (150, -340) .. (1150, 460) misses the window (x < 100) but not the popup.
+    s.viewer_mut().set_camera(camera_at(650.0, 60.0, 1.0));
+    assert_eq!(s.visible(), vec![w(1)]);
+}
+
+#[test]
+fn the_pointer_over_a_popup_enters_its_window() {
+    let mut s = shell_with_window();
+    open_popup(&mut s, 1, 1, None, menu_rules((190, 90), (100, 40)), false);
+    // Screen (650, 460) is canvas (150, 60): in the popup, outside the window.
+    let out = motion(&mut s, 650.0, 460.0);
+    assert!(
+        out.contains(&ClientInput::PointerEnter {
+            window: w(1),
+            pos: Point::new(250.0, 110.0),
+        }),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_grabbing_popup_takes_the_keyboard_and_keys_go_to_its_window() {
+    let mut s = shell_with_window();
+    let out = open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), true);
+    assert!(has_popup_keyboard(&out, 1, Some(1)), "{out:?}");
+    let out = key(&mut s, KEY_A, Keysym::a, true);
+    assert_eq!(
+        out,
+        vec![ClientInput::Key {
+            window: w(1),
+            keycode: KEY_A,
+            pressed: true
+        }]
+    );
+}
+
+#[test]
+fn during_a_grab_other_applications_get_no_pointer() {
+    let mut s = shell_with_far_window(2, 2);
+    open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), true);
+    let out = motion(&mut s, 800.0, 400.0);
+    assert!(
+        out.contains(&ClientInput::PointerLeave { window: w(1) }),
+        "{out:?}"
+    );
+    assert!(
+        !out.iter()
+            .any(|i| matches!(i, ClientInput::PointerEnter { .. })),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn during_a_grab_the_applications_other_windows_get_the_pointer() {
+    let mut s = shell_with_far_window(3, 1);
+    open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), true);
+    let out = motion(&mut s, 800.0, 400.0);
+    assert!(
+        out.iter()
+            .any(|i| matches!(i, ClientInput::PointerEnter { window, .. } if *window == w(3))),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_press_outside_the_application_closes_its_menus_and_is_swallowed() {
+    let mut s = shell_with_window();
+    open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), true);
+    open_popup(&mut s, 2, 1, Some(1), menu_rules((100, 0), (80, 40)), true);
+    s.take_commands();
+    motion(&mut s, 100.0, 100.0);
+    let out = left(&mut s, true);
+    assert_eq!(dismissals(&s.take_commands()), vec![p(2), p(1)]);
+    assert!(has_popup_keyboard(&out, 1, None), "{out:?}");
+    assert!(!has_button(&out), "{out:?}");
+    assert_eq!(s.cursor(), CursorShape::Default, "no pan");
+    assert_eq!(s.windows().focus(), Some(w(1)));
+    let out = left(&mut s, false);
+    assert!(!has_button(&out), "the release is swallowed too: {out:?}");
+    assert!(s.windows().get(w(1)).unwrap().popups.is_empty());
+}
+
+#[test]
+fn a_press_on_the_menu_or_its_window_is_delivered() {
+    let mut s = shell_with_window();
+    open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), true);
+    s.take_commands();
+    // On the popup (window (20, 20) = screen (420, 370)), then on the window outside it.
+    for (x, y) in [(420.0, 370.0), (590.0, 440.0)] {
+        motion(&mut s, x, y);
+        let out = left(&mut s, true);
+        assert!(has_button(&out), "{out:?}");
+        left(&mut s, false);
+        assert!(dismissals(&s.take_commands()).is_empty());
+    }
+}
+
+#[test]
+fn a_mod_gesture_during_a_grab_closes_the_menus_and_starts_at_once() {
+    let mut s = shell_with_far_window(2, 2);
+    open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), true);
+    s.take_commands();
+    let out = start_move(&mut s, 800.0, 400.0);
+    assert_eq!(dismissals(&s.take_commands()), vec![p(1)]);
+    assert!(has_popup_keyboard(&out, 1, None), "{out:?}");
+    assert_eq!(s.cursor(), CursorShape::Move);
+}
+
+#[test]
+fn a_background_press_during_a_grab_is_swallowed_but_pans_with_only_a_tooltip() {
+    let mut s = shell_with_window();
+    open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), true);
+    s.take_commands();
+    motion(&mut s, 100.0, 100.0);
+    left(&mut s, true);
+    assert_eq!(dismissals(&s.take_commands()), vec![p(1)]);
+    assert_eq!(s.cursor(), CursorShape::Default, "swallowed: no pan");
+    left(&mut s, false);
+    // A tooltip only (no grab): the press pans and closes the tooltip.
+    open_popup(&mut s, 2, 1, None, menu_rules((10, 10), (100, 40)), false);
+    s.take_commands();
+    left(&mut s, true);
+    assert_eq!(dismissals(&s.take_commands()), vec![p(2)]);
+    assert_eq!(s.cursor(), CursorShape::Grabbing);
+    left(&mut s, false);
+}
+
+#[test]
+fn a_popup_on_two_viewers_shows_its_window_on_both() {
+    let mut s = two_viewers();
+    // Window 1 opens at A's centre: canvas (-600, -50) .. (-400, 50). B shows x >= 0.
+    s.apply(mapped(1, 200.0, 100.0));
+    assert!(!s.visible_in(B).contains(&w(1)));
+    // A 500-wide popup at window (190, 0) reaches canvas x 90.
+    let rules = PopupRules {
+        adjust: Adjust::NONE,
+        ..menu_rules((190, 0), (500, 40))
+    };
+    open_popup(&mut s, 1, 1, None, rules, false);
+    assert!(s.visible_in(A).contains(&w(1)));
+    assert!(s.visible_in(B).contains(&w(1)));
+}
+
+#[test]
+fn a_grabbing_popup_during_a_gesture_is_dismissed() {
+    let mut s = shell_with_window();
+    start_move(&mut s, 500.0, 400.0);
+    s.take_commands();
+    s.apply(requested(1, 1, None, menu_rules((10, 10), (100, 40)), true));
+    let cmds = s.take_commands();
+    assert_eq!(dismissals(&cmds), vec![p(1)]);
+    assert!(placements(&cmds).is_empty());
+}
+
+#[test]
+fn a_new_grab_of_another_application_closes_the_old_chain_first() {
+    let mut s = shell_with_far_window(2, 2);
+    open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), true);
+    s.take_commands();
+    s.apply(requested(2, 2, None, menu_rules((10, 10), (50, 20)), true));
+    let cmds = s.take_commands();
+    let order: Vec<&WindowCommand> = cmds
+        .iter()
+        .filter(|c| {
+            matches!(
+                c,
+                WindowCommand::DismissPopup { .. } | WindowCommand::PlacePopup { .. }
+            )
+        })
+        .collect();
+    assert!(
+        matches!(
+            order[..],
+            [
+                WindowCommand::DismissPopup { id: d },
+                WindowCommand::PlacePopup { id: pl, .. }
+            ] if *d == p(1) && *pl == p(2)
+        ),
+        "{cmds:?}"
+    );
+}
+
+#[test]
+fn press_drag_release_reaches_the_menu() {
+    let mut s = shell_with_window();
+    motion(&mut s, 450.0, 380.0);
+    button(&mut s, Button::Right, BTN_RIGHT, true);
+    open_popup(&mut s, 1, 1, None, menu_rules((50, 30), (100, 80)), true);
+    // With the button held, move into the popup's part outside the window: window (180, 90).
+    let out = motion(&mut s, 580.0, 440.0);
+    assert!(
+        out.contains(&ClientInput::PointerMotion {
+            window: w(1),
+            pos: Point::new(180.0, 90.0),
+        }),
+        "{out:?}"
+    );
+    let out = button(&mut s, Button::Right, BTN_RIGHT, false);
+    assert!(
+        out.contains(&ClientInput::PointerButton {
+            window: w(1),
+            code: BTN_RIGHT,
+            pressed: false,
+        }),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_press_on_another_window_of_the_application_focuses_it_and_closes_the_menus() {
+    let mut s = shell_with_far_window(3, 1);
+    open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), true);
+    s.take_commands();
+    motion(&mut s, 800.0, 400.0);
+    let out = left(&mut s, true);
+    assert_eq!(dismissals(&s.take_commands()), vec![p(1)]);
+    let keyboard_back = out.iter().position(|i| {
+        *i == ClientInput::PopupKeyboard {
+            window: w(1),
+            popup: None,
+        }
+    });
+    let focus = out
+        .iter()
+        .position(|i| *i == ClientInput::KeyboardFocus(Some(w(3))));
+    assert!(
+        keyboard_back.is_some() && focus.is_some() && keyboard_back < focus,
+        "{out:?}"
+    );
+    assert!(
+        out.contains(&ClientInput::PointerButton {
+            window: w(3),
+            code: BTN_LEFT,
+            pressed: true,
+        }),
+        "{out:?}"
+    );
+}
+
+// --- submenus, reposition and reactive popups (popups tasks T023) -----------------------------
+
+fn reactive(rules: PopupRules) -> PopupRules {
+    PopupRules {
+        reactive: true,
+        ..rules
+    }
+}
+
+#[test]
+fn a_submenu_is_placed_against_its_menu_in_the_menus_coordinates() {
+    let mut s = shell_with_window();
+    // The menu at window (190, 10) ends at window x 290; the view ends at window x 600.
+    open_popup(&mut s, 1, 1, None, menu_rules((190, 10), (100, 40)), true);
+    s.take_commands();
+    // In the menu's coordinates the view is (-590, -360) .. (410, 440): a 350-wide submenu at
+    // x 100 would end at 450, so it flips to the left of its anchor.
+    let rules = menu_rules((100, 0), (350, 40));
+    s.apply(requested(2, 1, Some(1), rules, true));
+    let expected = place(&rules, Some(IRect::new(-590, -360, 1000, 800)));
+    assert_eq!(expected, IRect::new(-250, 0, 350, 40));
+    assert_eq!(placements(&s.take_commands()), vec![(p(2), expected, None)]);
+}
+
+#[test]
+fn the_keyboard_moves_to_a_submenu_and_back() {
+    let mut s = shell_with_window();
+    let out = open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), true);
+    assert!(has_popup_keyboard(&out, 1, Some(1)), "{out:?}");
+    let out = open_popup(&mut s, 2, 1, Some(1), menu_rules((100, 0), (80, 40)), true);
+    assert!(has_popup_keyboard(&out, 1, Some(2)), "{out:?}");
+    let out = s.apply(WindowEvent::PopupUnmapped { id: p(2) });
+    assert!(has_popup_keyboard(&out, 1, Some(1)), "{out:?}");
+    assert!(dismissals(&s.take_commands()).is_empty());
+}
+
+#[test]
+fn a_menu_that_does_not_fit_at_100_percent_fits_at_50() {
+    let mut s = shell_with_window();
+    // The menu of the first popup test, which flips at 100% (it would end at window x 640).
+    let rules = menu_rules((190, 90), (450, 100));
+    s.viewer_mut().set_camera(camera_at(0.0, 0.0, 0.5));
+    s.take_commands();
+    s.apply(requested(1, 1, None, rules, false));
+    // At 50% the view is (-1000, -800) .. (1000, 800): window (-900, -750) .. (1100, 850).
+    assert_eq!(
+        placements(&s.take_commands()),
+        vec![(p(1), IRect::new(190, 90, 450, 100), None)]
+    );
+}
+
+#[test]
+fn a_new_window_size_places_reactive_popups_again() {
+    let mut s = shell_with_window();
+    open_popup(
+        &mut s,
+        1,
+        1,
+        None,
+        reactive(menu_rules((10, 10), (100, 40))),
+        false,
+    );
+    open_popup(&mut s, 2, 1, None, menu_rules((10, 60), (100, 40)), false);
+    open_popup(
+        &mut s,
+        3,
+        1,
+        Some(1),
+        reactive(menu_rules((100, 0), (80, 40))),
+        false,
+    );
+    // A reactive child of a popup that is not placed again stays too.
+    open_popup(
+        &mut s,
+        4,
+        1,
+        Some(2),
+        reactive(menu_rules((100, 0), (80, 40))),
+        false,
+    );
+    s.take_commands();
+    answer(&mut s, 1, Size::new(300.0, 100.0), false);
+    assert_eq!(
+        placements(&s.take_commands()),
+        vec![
+            (p(1), IRect::new(10, 10, 100, 40), None),
+            (p(3), IRect::new(100, 0, 80, 40), None),
+        ]
+    );
+    answer(&mut s, 1, Size::new(300.0, 100.0), false);
+    assert!(
+        placements(&s.take_commands()).is_empty(),
+        "the same size again changes nothing"
+    );
+}
+
+#[test]
+fn a_reposition_is_answered_with_its_token() {
+    let mut s = shell_with_window();
+    open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), false);
+    open_popup(
+        &mut s,
+        2,
+        1,
+        Some(1),
+        reactive(menu_rules((100, 0), (80, 40))),
+        false,
+    );
+    open_popup(&mut s, 3, 1, Some(1), menu_rules((0, 40), (80, 40)), false);
+    s.take_commands();
+    s.apply(WindowEvent::PopupRepositionRequested {
+        id: p(1),
+        rules: menu_rules((30, 20), (120, 50)),
+        token: 7,
+    });
+    // The menu moves; its reactive child is placed again, after it and without a token.
+    assert_eq!(
+        placements(&s.take_commands()),
+        vec![
+            (p(1), IRect::new(30, 20, 120, 50), Some(7)),
+            (p(2), IRect::new(100, 0, 80, 40), None),
+        ]
+    );
+    assert_eq!(
+        s.windows()
+            .get(w(1))
+            .unwrap()
+            .popup(p(1))
+            .unwrap()
+            .rules
+            .size,
+        (120, 50),
+        "the new rules are kept"
+    );
+}
+
+#[test]
+fn a_popup_follows_its_window_when_the_application_changes_its_origin() {
+    let mut s = shell_with_maximized_window();
+    // Maximized: window 1 covers the view, canvas (-500, -400) .. (500, 400). A 40x40 popup at
+    // window (-50, 10), not adjusted.
+    let rules = PopupRules {
+        adjust: Adjust::NONE,
+        ..menu_rules((-50, 10), (40, 40))
+    };
+    open_popup(&mut s, 1, 1, None, rules, false);
+    s.take_commands();
+    // A smaller size keeps the centre: the window is now at canvas (-400, -300).
+    answer(&mut s, 1, Size::new(800.0, 600.0), false);
+    assert!(
+        placements(&s.take_commands()).is_empty(),
+        "not reactive: it keeps its place in the window"
+    );
+    // Screen (60, 120) is canvas (-440, -280): on the popup, left of the window.
+    let out = motion(&mut s, 60.0, 120.0);
+    let at = Point::new(-40.0, 20.0);
+    assert!(
+        out.iter().any(|i| matches!(
+            i,
+            ClientInput::PointerEnter { window, pos } | ClientInput::PointerMotion { window, pos }
+                if *window == w(1) && *pos == at
+        )),
+        "{out:?}"
+    );
+}
+
+// --- canvas actions close popups (popups tasks T027) ------------------------------------------
+
+/// Opens a grabbing menu 1 with a grabbing submenu 2 in focused window `a`, and a tooltip 3 in
+/// window `b`.
+fn open_menus(s: &mut Shell, a: u64, b: u64) {
+    let out = open_popup(s, 1, a, None, menu_rules((10, 10), (100, 40)), true);
+    assert!(has_popup_keyboard(&out, a, Some(1)), "{out:?}");
+    open_popup(s, 2, a, Some(1), menu_rules((100, 0), (80, 40)), true);
+    open_popup(s, 3, b, None, menu_rules((10, 10), (50, 20)), false);
+    s.take_commands();
+}
+
+/// All popups of `open_menus` closed, the submenu before its menu, and the keyboard back to
+/// window `a`.
+fn assert_menus_closed(cmds: &[WindowCommand], out: &[ClientInput], a: u64, what: &str) {
+    let closed = dismissals(cmds);
+    let at = |n| closed.iter().position(|c| *c == p(n));
+    assert_eq!(closed.len(), 3, "{what}: {cmds:?}");
+    assert!(at(2) < at(1) && at(3).is_some(), "{what}: {closed:?}");
+    assert!(has_popup_keyboard(out, a, None), "{what}: {out:?}");
+}
+
+fn wheel_up(s: &mut Shell) -> Vec<ClientInput> {
+    send(
+        s,
+        InputEvent::Scroll {
+            source: ScrollSource::Wheel,
+            delta: Vector::new(0.0, -10.0),
+            value120: Some(Vector::new(0.0, -120.0)),
+        },
+    )
+}
+
+type Action = Box<dyn Fn(&mut Shell) -> Vec<ClientInput>>;
+type Check = Box<dyn Fn(&Shell, &[WindowCommand])>;
+
+#[test]
+fn canvas_actions_close_every_popup_first() {
+    let press_q = |s: &mut Shell| {
+        let mut out = key(s, KEY_Q, Keysym::q, true);
+        out.extend(key(s, KEY_Q, Keysym::q, false));
+        out
+    };
+    let cases: Vec<(&str, Action, Check)> = vec![
+        (
+            "Mod+Tab",
+            Box::new(|s| mod_tab(s, false)),
+            Box::new(|s, _| assert_eq!(s.windows().focus(), Some(w(2)))),
+        ),
+        (
+            "Mod+Shift+Tab",
+            Box::new(|s| mod_tab(s, true)),
+            Box::new(|s, _| assert_eq!(s.windows().focus(), Some(w(2)))),
+        ),
+        (
+            "Mod+Q",
+            Box::new(move |s| {
+                mods(s, super_mod(), 8);
+                press_q(s)
+            }),
+            Box::new(|_, cmds| {
+                let close = cmds
+                    .iter()
+                    .position(|c| *c == WindowCommand::Close { window: w(1) });
+                let dismiss = cmds
+                    .iter()
+                    .position(|c| matches!(c, WindowCommand::DismissPopup { .. }));
+                assert!(close.is_some() && dismiss < close, "{cmds:?}");
+            }),
+        ),
+        (
+            "Mod+0",
+            Box::new(|s| {
+                mods(s, super_mod(), 8);
+                key(s, KEY_0, Keysym::_0, true)
+            }),
+            Box::new(|s, _| assert_eq!(s.viewer().camera(), camera_at(0.0, 0.0, 1.0))),
+        ),
+        (
+            "the first Mod+Shift+Q",
+            Box::new(|s| {
+                mods(s, super_shift(), 9);
+                quit_press(s, 0).1
+            }),
+            Box::new(|_, _| {}),
+        ),
+        (
+            "move (Mod + left)",
+            Box::new(|s| start_move(s, 800.0, 400.0)),
+            Box::new(|s, _| assert_eq!(s.cursor(), CursorShape::Move)),
+        ),
+        (
+            "resize (Mod + right)",
+            Box::new(|s| start_resize(s, 800.0, 400.0)),
+            Box::new(|s, _| assert_ne!(s.cursor(), CursorShape::Default)),
+        ),
+        (
+            "Mod + scroll",
+            Box::new(|s| {
+                motion(s, 500.0, 400.0);
+                mods(s, super_mod(), 8);
+                wheel_up(s)
+            }),
+            Box::new(|s, _| assert!((s.viewer().camera().zoom - 1.1).abs() < 1e-9)),
+        ),
+        (
+            "pinch",
+            Box::new(|s| {
+                let mut out = send(s, InputEvent::PinchBegin);
+                out.extend(send(s, InputEvent::PinchUpdate { scale: 2.0 }));
+                out.extend(send(s, InputEvent::PinchEnd { cancelled: false }));
+                out
+            }),
+            Box::new(|s, _| assert!((s.viewer().camera().zoom - 2.0).abs() < 1e-9)),
+        ),
+        (
+            "the display unplugged",
+            Box::new(|s| s.remove_viewer(ViewerId(1))),
+            Box::new(|s, _| assert_eq!(s.viewers().count(), 0)),
+        ),
+    ];
+    for (what, action, check) in cases {
+        let mut s = shell_with_far_window(2, 2);
+        open_menus(&mut s, 1, 2);
+        let out = action(&mut s);
+        let cmds = s.take_commands();
+        assert_menus_closed(&cmds, &out, 1, what);
+        check(&s, &cmds);
+    }
+}
+
+#[test]
+fn a_spawn_binding_closes_every_popup_first() {
+    let mut s = spawn_shell(ModKey::Super);
+    s.apply(mapped(2, 100.0, 50.0));
+    // Window 1 is exposed left of window 2.
+    motion(&mut s, 410.0, 360.0);
+    left(&mut s, true);
+    left(&mut s, false);
+    s.take_commands();
+    open_menus(&mut s, 1, 2);
+    mods(&mut s, ModKey::Super.modifiers(), 64);
+    let (effect, out) = s.handle(&InputEvent::Key {
+        keycode: KEY_ENTER,
+        binding_sym: Keysym::Return,
+        pressed: true,
+        time_ms: 0,
+    });
+    assert_eq!(effect.spawn, Some(0));
+    assert_menus_closed(&s.take_commands(), &out, 1, "spawn");
+}
+
+#[test]
+fn a_bound_pan_closes_every_popup_first() {
+    let mut s = shell_with_pointer_binds();
+    open_menus(&mut s, 2, 1);
+    motion(&mut s, 10.0, 10.0);
+    mods(&mut s, super_shift(), 9);
+    let out = left(&mut s, true);
+    assert_menus_closed(&s.take_commands(), &out, 2, "pan");
+    assert_eq!(s.cursor(), CursorShape::Grabbing);
+}
+
+#[test]
+fn a_pan_press_leaving_fullscreen_closes_every_popup_first() {
+    let mut s = shell_with_pointer_binds();
+    request_fullscreen(&mut s, 2, true);
+    answer(&mut s, 2, Size::new(1000.0, 800.0), true);
+    s.take_commands();
+    open_menus(&mut s, 2, 1);
+    motion(&mut s, 10.0, 10.0);
+    mods(&mut s, super_mod(), 64);
+    let out = middle(&mut s, true);
+    assert_menus_closed(&s.take_commands(), &out, 2, "pan out of fullscreen");
+    assert_eq!(s.fullscreen(), None);
+}
+
+#[test]
+fn maximize_and_fullscreen_close_every_popup_whoever_asked() {
+    let cases: Vec<(&str, bool, Action)> = vec![
+        (
+            "maximize",
+            false,
+            Box::new(|s| request_maximize(s, 1, true)),
+        ),
+        (
+            "unmaximize",
+            true,
+            Box::new(|s| request_maximize(s, 1, false)),
+        ),
+        (
+            "fullscreen",
+            false,
+            Box::new(|s| request_fullscreen(s, 1, true)),
+        ),
+        (
+            "leaving fullscreen",
+            true,
+            Box::new(|s| request_fullscreen(s, 1, false)),
+        ),
+    ];
+    for (what, first_on, action) in cases {
+        let mut s = shell_with_far_window(2, 2);
+        if first_on {
+            // Into the state first, then the menus open.
+            if what == "unmaximize" {
+                request_maximize(&mut s, 1, true);
+            } else {
+                request_fullscreen(&mut s, 1, true);
+            }
+            answer(&mut s, 1, Size::new(1000.0, 800.0), true);
+            s.take_commands();
+        }
+        open_menus(&mut s, 1, 2);
+        let out = action(&mut s);
+        let cmds = s.take_commands();
+        assert_menus_closed(&cmds, &out, 1, what);
+        // Before the state's configure.
+        let dismiss = cmds
+            .iter()
+            .position(|c| matches!(c, WindowCommand::DismissPopup { .. }));
+        let configure = cmds
+            .iter()
+            .position(|c| matches!(c, WindowCommand::Configure { .. }));
+        assert!(
+            configure.is_some() && dismiss < configure,
+            "{what}: {cmds:?}"
+        );
+    }
+}
+
+#[test]
+fn focus_moving_to_another_window_closes_popups() {
+    let mut s = shell_with_far_window(2, 2);
+    // Window 4 opens focused; a tooltip then shows in window 2.
+    s.apply(mapped(4, 100.0, 50.0));
+    open_popup(&mut s, 3, 2, None, menu_rules((10, 10), (50, 20)), false);
+    s.take_commands();
+    s.apply(WindowEvent::Unmapped { id: w(4) });
+    assert_ne!(s.windows().focus(), Some(w(4)));
+    assert_eq!(dismissals(&s.take_commands()), vec![p(3)]);
+}
+
+#[test]
+fn a_window_going_away_takes_its_popups_and_its_grab() {
+    let mut s = shell_with_far_window(2, 2);
+    open_menus(&mut s, 1, 2);
+    let out = s.apply(WindowEvent::Unmapped { id: w(1) });
+    // Its own popups went with it; the focus then moves to window 2, which closes the tooltip.
+    assert_eq!(dismissals(&s.take_commands()), vec![p(3)]);
+    assert!(
+        out.contains(&ClientInput::KeyboardFocus(Some(w(2)))),
+        "{out:?}"
+    );
+    // The grab is over: a press on the background is not swallowed, it pans.
+    motion(&mut s, 100.0, 100.0);
+    left(&mut s, true);
+    assert_eq!(s.cursor(), CursorShape::Grabbing);
+}
+
+// --- tooltips: popups without a grab (popups tasks T032) --------------------------------------
+
+#[test]
+fn a_tooltip_takes_no_keyboard_and_survives_clicks_in_its_window() {
+    let mut s = shell_with_window();
+    // A 100x40 tooltip at window (150, 90): canvas (50, 40) .. (150, 80), half outside the window.
+    let out = open_popup(&mut s, 1, 1, None, menu_rules((150, 90), (100, 40)), false);
+    assert!(
+        !out.iter()
+            .any(|i| matches!(i, ClientInput::PopupKeyboard { .. })),
+        "{out:?}"
+    );
+    assert!(
+        s.windows()
+            .get(w(1))
+            .unwrap()
+            .popup(p(1))
+            .unwrap()
+            .shown
+            .is_some()
+    );
+    s.take_commands();
+    // The pointer over its part outside the window enters the window, inside the tooltip.
+    let out = motion(&mut s, 640.0, 470.0);
+    assert!(
+        out.contains(&ClientInput::PointerEnter {
+            window: w(1),
+            pos: Point::new(240.0, 120.0),
+        }),
+        "{out:?}"
+    );
+    // A click elsewhere in the window is delivered; RubickWay leaves the tooltip alone.
+    motion(&mut s, 420.0, 370.0);
+    let out = left(&mut s, true);
+    assert!(has_button(&out), "{out:?}");
+    left(&mut s, false);
+    assert!(dismissals(&s.take_commands()).is_empty());
+    // Keys go to the focused window.
+    let out = key(&mut s, KEY_A, Keysym::a, true);
+    assert_eq!(
+        out,
+        vec![ClientInput::Key {
+            window: w(1),
+            keycode: KEY_A,
+            pressed: true
+        }]
+    );
+    // A reposition moves it.
+    s.apply(WindowEvent::PopupRepositionRequested {
+        id: p(1),
+        rules: menu_rules((20, 90), (100, 40)),
+        token: 3,
+    });
+    assert_eq!(
+        placements(&s.take_commands()),
+        vec![(p(1), IRect::new(20, 90, 100, 40), Some(3))]
+    );
+}
+
+// --- convergence (popups tasks T039, T040) ----------------------------------------------------
+
+#[test]
+fn when_the_application_ends_its_grab_the_pointer_enters_what_is_under_it() {
+    let mut s = shell_with_far_window(2, 2);
+    open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), true);
+    // During the grab, window 2 of another application gets no pointer.
+    let out = motion(&mut s, 800.0, 400.0);
+    assert!(
+        !out.iter()
+            .any(|i| matches!(i, ClientInput::PointerEnter { .. })),
+        "{out:?}"
+    );
+    // The application closes its menu itself (Escape): the grab ends.
+    let out = s.apply(WindowEvent::PopupUnmapped { id: p(1) });
+    assert!(has_popup_keyboard(&out, 1, None), "{out:?}");
+    assert!(
+        out.iter()
+            .any(|i| matches!(i, ClientInput::PointerEnter { window, .. } if *window == w(2))),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn a_menu_changing_its_size_places_its_reactive_submenus_again() {
+    let mut s = shell_with_window();
+    open_popup(&mut s, 1, 1, None, menu_rules((10, 10), (100, 40)), false);
+    open_popup(
+        &mut s,
+        2,
+        1,
+        Some(1),
+        reactive(menu_rules((100, 0), (80, 40))),
+        false,
+    );
+    open_popup(&mut s, 3, 1, Some(1), menu_rules((0, 40), (80, 40)), false);
+    s.take_commands();
+    let size = Size::new(150.0, 40.0);
+    let updated = WindowEvent::PopupUpdated {
+        id: p(1),
+        at: (10, 10),
+        size,
+        input: full(size),
+    };
+    s.apply(updated.clone());
+    assert_eq!(
+        placements(&s.take_commands()),
+        vec![(p(2), IRect::new(100, 0, 80, 40), None)]
+    );
+    s.apply(updated);
+    assert!(
+        placements(&s.take_commands()).is_empty(),
+        "the same size again changes nothing"
+    );
 }

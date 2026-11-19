@@ -447,6 +447,9 @@ impl App {
                 self.pace.forget(id.0);
             }
             let inputs = self.shell.apply(event);
+            // Commands first: popups the shell dismissed are gone before the input that
+            // follows is routed (popups research P8).
+            self.server.command(&self.shell.take_commands());
             self.server.deliver(&inputs, self.now_ms());
         }
         self.server.command(&self.shell.take_commands());
@@ -468,6 +471,7 @@ impl App {
             match event {
                 BackendEvent::Input(input) => {
                     let (effect, inputs) = self.shell.handle(&input);
+                    self.server.command(&self.shell.take_commands());
                     self.server.deliver(&inputs, self.now_ms());
                     if effect.quit {
                         tracing::info!("quit requested");
@@ -513,6 +517,7 @@ impl App {
                     }
                     self.server.remove_output(id.0);
                     let inputs = self.shell.remove_viewer(id);
+                    self.server.command(&self.shell.take_commands());
                     self.server.deliver(&inputs, self.now_ms());
                     self.reflow_outputs();
                     // The other displays may show what it showed.
