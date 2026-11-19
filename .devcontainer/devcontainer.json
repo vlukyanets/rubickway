@@ -1,0 +1,33 @@
+{
+  // The same image as CI (.devcontainer/Dockerfile): building, clippy and the tests. Hardware
+  // checks (quickstart) stay on the host.
+  "name": "RubickWay",
+  "build": {
+    "context": "..",
+    "dockerfile": "Dockerfile"
+  },
+  // The repository sits at the same absolute path as on the host: git worktrees under
+  // .claude/worktrees/ record the host path of the main repository.
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind",
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "remoteUser": "dev",
+  "updateRemoteUserUID": true,
+  // Downloaded crates and build output live in volumes: they survive rebuilds of the container,
+  // and the container's builds never mix with the host's in target/.
+  "mounts": [
+    "source=rubickway-cargo-registry,target=/opt/cargo/registry,type=volume",
+    "source=rubickway-target,target=/home/dev/target,type=volume"
+  ],
+  "containerEnv": {
+    "CARGO_TARGET_DIR": "/home/dev/target"
+  },
+  // The network filter (init-firewall.sh) needs these to set up iptables.
+  "runArgs": ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW"],
+  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh",
+  "waitFor": "postStartCommand",
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer"]
+    }
+  }
+}
