@@ -226,10 +226,27 @@ mod tests {
 
     #[test]
     fn no_finished_child_stays_behind() {
-        run_and_collect(&["true"], Vec::new());
-        // SAFETY: waitpid with WNOHANG on any child only reads status; a zombie of ours would
-        // be reaped here and show up as a pid > 0.
-        let reaped = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
-        assert!(reaped <= 0, "a finished child was left: {reaped}");
+        // Only this test's own child is checked: the other tests here run in threads of the
+        // same process, and `waitpid(-1)` would take their children from them (bug
+        // spawn-test-reaps-children). The child writes its pid ($$) where the test finds it.
+        let file =
+            std::env::temp_dir().join(format!("rubickway-spawn-child-{}", std::process::id()));
+        let script = format!("echo $$ > '{}'", file.display());
+        assert_eq!(
+            run_and_collect(&["sh", "-c", &script], Vec::new()),
+            Vec::new()
+        );
+        let pid: libc::pid_t = std::fs::read_to_string(&file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_file(&file);
+        // SAFETY: waitpid with WNOHANG on this one pid only reads its status. Once `run` has
+        // waited for it, it is gone (ECHILD); a zombie left behind would come back as its pid.
+        let reaped = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        let error = std::io::Error::last_os_error();
+        assert_eq!(reaped, -1, "a finished child was left: {pid}");
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
     }
 }
