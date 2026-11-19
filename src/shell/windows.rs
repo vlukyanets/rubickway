@@ -6,10 +6,15 @@
 use crate::canvas::{Point, Rect, Size};
 
 use super::geometry::{Edges, SizeLimits};
+use super::popups::{Popup, PopupId};
 
 /// A window's identity, assigned by the server when a toplevel first shows content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowId(pub u64);
+
+/// The application a window belongs to: the server's client number (popups research P6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct AppId(pub u64);
 
 /// Which point of a window stays fixed when the application commits a new size (research W4).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -53,12 +58,81 @@ pub struct Window {
     pub mode: Mode,
     /// The parent window set by the application (dialogs).
     pub parent: Option<WindowId>,
+    /// The application it belongs to.
+    pub app: AppId,
+    /// Its popups, in creation order (popups research P5).
+    pub popups: Vec<Popup>,
 }
 
 impl Window {
     /// The window's rectangle on the canvas.
     pub fn rect(&self) -> Rect {
         Rect::new(self.origin, self.size)
+    }
+
+    pub fn popup(&self, id: PopupId) -> Option<&Popup> {
+        self.popups.iter().find(|p| p.id == id)
+    }
+
+    /// Where popup `id`'s window geometry starts, in window coordinates: the positions along its
+    /// parent chain (shown, else placed).
+    pub fn popup_origin(&self, id: PopupId) -> Option<Point> {
+        let (mut x, mut y) = (0.0, 0.0);
+        let mut current = Some(id);
+        for _ in 0..=self.popups.len() {
+            let Some(c) = current else {
+                return Some(Point::new(x, y));
+            };
+            let p = self.popup(c)?;
+            let (px, py) = p.shown.as_ref().map_or((p.placed.x, p.placed.y), |s| s.at);
+            x += f64::from(px);
+            y += f64::from(py);
+            current = p.parent;
+        }
+        None
+    }
+
+    /// Where popup `id` will be once its placements apply, in window coordinates: the newest
+    /// placements along its parent chain. Placing a child goes from here (popups research P10).
+    pub fn placed_origin(&self, id: PopupId) -> Option<Point> {
+        let (mut x, mut y) = (0.0, 0.0);
+        let mut current = Some(id);
+        for _ in 0..=self.popups.len() {
+            let Some(c) = current else {
+                return Some(Point::new(x, y));
+            };
+            let p = self.popup(c)?;
+            x += f64::from(p.placed.x);
+            y += f64::from(p.placed.y);
+            current = p.parent;
+        }
+        None
+    }
+
+    /// Each shown popup's rectangle and input shape, in window coordinates.
+    fn shown_popups(&self) -> impl Iterator<Item = (Rect, &[Rect])> {
+        self.popups.iter().filter_map(|p| {
+            let shown = p.shown.as_ref()?;
+            let origin = self.popup_origin(p.id)?;
+            Some((Rect::new(origin, shown.size), shown.input.as_slice()))
+        })
+    }
+
+    /// The window's rectangle together with its shown popups' (canvas).
+    pub fn extent(&self) -> Rect {
+        let v = self.origin - Point::new(0.0, 0.0);
+        let mut rects = vec![self.rect()];
+        rects.extend(self.shown_popups().map(|(r, _)| r.translate(v)));
+        Rect::bounding(&rects).unwrap_or_else(|| self.rect())
+    }
+
+    /// Whether the window or one of its shown popups accepts input at window point `local`.
+    fn accepts(&self, local: Point) -> bool {
+        self.input.iter().any(|r| r.contains(local))
+            || self.shown_popups().any(|(rect, input)| {
+                let inside = Point::new(local.x - rect.origin.x, local.y - rect.origin.y);
+                input.iter().any(|r| r.contains(inside))
+            })
     }
 }
 
@@ -90,6 +164,8 @@ impl Windows {
             anchor: Anchor::TopLeft,
             mode: Mode::Normal,
             parent: None,
+            app: AppId::default(),
+            popups: Vec::new(),
         });
         self.focus = Some(id);
     }
@@ -171,11 +247,63 @@ impl Windows {
         self.mru.insert(at, id);
     }
 
-    /// `p` (canvas) in `id`'s coordinates if `id` accepts input there.
+    /// `p` (canvas) in `id`'s coordinates if `id` (or one of its popups) accepts input there.
     pub fn hit_window(&self, id: WindowId, p: Point) -> Option<Point> {
         let w = self.get(id)?;
         let local = Point::new(p.x - w.origin.x, p.y - w.origin.y);
-        w.input.iter().any(|r| r.contains(local)).then_some(local)
+        w.accepts(local).then_some(local)
+    }
+
+    /// Adds a popup to its window.
+    pub fn add_popup(&mut self, window: WindowId, popup: Popup) {
+        if let Some(w) = self.get_mut(window) {
+            w.popups.push(popup);
+        }
+    }
+
+    pub fn popup_mut(&mut self, window: WindowId, id: PopupId) -> Option<&mut Popup> {
+        self.get_mut(window)?.popups.iter_mut().find(|p| p.id == id)
+    }
+
+    /// The window popup `id` belongs to.
+    pub fn window_of_popup(&self, id: PopupId) -> Option<WindowId> {
+        self.stack
+            .iter()
+            .find(|w| w.popup(id).is_some())
+            .map(|w| w.id)
+    }
+
+    /// Removes popup `id` and the popups above it; returns their ids, the topmost first.
+    pub fn remove_popup(&mut self, window: WindowId, id: PopupId) -> Vec<PopupId> {
+        let Some(w) = self.get_mut(window) else {
+            return Vec::new();
+        };
+        let mut gone = vec![id];
+        let mut i = 0;
+        while i < gone.len() {
+            let parent = gone[i];
+            gone.extend(
+                w.popups
+                    .iter()
+                    .filter(|p| p.parent == Some(parent))
+                    .map(|p| p.id),
+            );
+            i += 1;
+        }
+        gone.retain(|g| w.popup(*g).is_some());
+        w.popups.retain(|p| !gone.contains(&p.id));
+        gone.sort_unstable_by(|a, b| b.cmp(a));
+        gone
+    }
+
+    /// Removes all popups of `window`; returns their ids, the topmost first.
+    pub fn take_popups(&mut self, window: WindowId) -> Vec<PopupId> {
+        let Some(w) = self.get_mut(window) else {
+            return Vec::new();
+        };
+        let mut gone: Vec<PopupId> = w.popups.drain(..).map(|p| p.id).collect();
+        gone.sort_unstable_by(|a, b| b.cmp(a));
+        gone
     }
 
     pub fn set_limits(&mut self, id: WindowId, limits: SizeLimits) {
@@ -187,6 +315,12 @@ impl Windows {
     pub fn set_parent(&mut self, id: WindowId, parent: Option<WindowId>) {
         if let Some(w) = self.get_mut(id) {
             w.parent = parent;
+        }
+    }
+
+    pub fn set_app(&mut self, id: WindowId, app: AppId) {
+        if let Some(w) = self.get_mut(id) {
+            w.app = app;
         }
     }
 
@@ -278,23 +412,21 @@ impl Windows {
         self.stack.iter()
     }
 
-    /// The topmost window accepting input at canvas point `p`, and `p` in its coordinates.
+    /// The topmost window accepting input at canvas point `p` (with its popups), and `p` in its
+    /// coordinates.
     pub fn hit(&self, p: Point) -> Option<(WindowId, Point)> {
         self.stack.iter().rev().find_map(|w| {
             let local = Point::new(p.x - w.origin.x, p.y - w.origin.y);
-            w.input
-                .iter()
-                .any(|r| r.contains(local))
-                .then_some((w.id, local))
+            w.accepts(local).then_some((w.id, local))
         })
     }
 
-    /// Windows that at least partly intersect `view` (canvas rectangle), back to front;
-    /// windows covered by others count (FR-006).
+    /// Windows that at least partly intersect `view` (canvas rectangle) with their popups, back
+    /// to front; windows covered by others count (FR-006).
     pub fn visible(&self, view: Rect) -> Vec<WindowId> {
         self.stack
             .iter()
-            .filter(|w| w.rect().intersects(&view))
+            .filter(|w| w.extent().intersects(&view))
             .map(|w| w.id)
             .collect()
     }
@@ -698,5 +830,133 @@ mod tests {
             prop_assert!((local.x - fx * 639.0).abs() < 1e-6);
             prop_assert!((local.y - fy * 479.0).abs() < 1e-6);
         }
+    }
+
+    // --- popups (popups tasks T013) ---------------------------------------------------------
+
+    use crate::shell::popups::Shown;
+    use crate::shell::positioner::{IRect, PopupRules};
+
+    /// A shown `w x h` popup at `at` relative to its parent.
+    fn popup(n: u64, parent: Option<u64>, at: (i32, i32), w: f64, h: f64) -> Popup {
+        Popup {
+            id: PopupId(n),
+            parent: parent.map(PopupId),
+            rules: PopupRules::default(),
+            grab: false,
+            placed: IRect::new(at.0, at.1, w as i32, h as i32),
+            shown: Some(Shown {
+                at,
+                size: Size::new(w, h),
+                input: full(Size::new(w, h)),
+            }),
+        }
+    }
+
+    /// Window 1, 100 x 100 at canvas (0, 0).
+    fn one_window() -> Windows {
+        let mut w = Windows::default();
+        let size = Size::new(100.0, 100.0);
+        w.map(id(1), size, full(size), Point::new(50.0, 50.0));
+        w
+    }
+
+    #[test]
+    fn the_extent_covers_the_window_and_its_shown_popups() {
+        let mut w = one_window();
+        let rect = w.get(id(1)).unwrap().rect();
+        assert_eq!(w.get(id(1)).unwrap().extent(), rect);
+        // A menu sticking out to the right, and a submenu of it further right.
+        w.add_popup(id(1), popup(1, None, (90, 10), 50.0, 30.0));
+        w.add_popup(id(1), popup(2, Some(1), (50, 0), 40.0, 20.0));
+        assert_eq!(
+            w.get(id(1)).unwrap().extent(),
+            Rect::new(Point::new(0.0, 0.0), Size::new(180.0, 100.0))
+        );
+        // A popup not shown yet does not count.
+        let mut hidden = popup(3, None, (0, 200), 10.0, 10.0);
+        hidden.shown = None;
+        w.add_popup(id(1), hidden);
+        assert_eq!(
+            w.get(id(1)).unwrap().extent(),
+            Rect::new(Point::new(0.0, 0.0), Size::new(180.0, 100.0))
+        );
+    }
+
+    #[test]
+    fn a_window_whose_popup_alone_is_in_view_is_visible() {
+        let mut w = one_window();
+        let view = Rect::new(Point::new(120.0, 0.0), Size::new(100.0, 100.0));
+        assert!(w.visible(view).is_empty());
+        w.add_popup(id(1), popup(1, None, (90, 10), 50.0, 30.0));
+        assert_eq!(w.visible(view), vec![id(1)]);
+    }
+
+    #[test]
+    fn a_popup_outside_the_window_is_hit_as_its_window() {
+        let mut w = one_window();
+        w.add_popup(id(1), popup(1, None, (90, 10), 50.0, 30.0));
+        assert_eq!(
+            w.hit(Point::new(130.0, 20.0)),
+            Some((id(1), Point::new(130.0, 20.0)))
+        );
+        assert_eq!(
+            w.hit_window(id(1), Point::new(130.0, 20.0)),
+            Some(Point::new(130.0, 20.0))
+        );
+        assert_eq!(w.hit(Point::new(130.0, 50.0)), None);
+    }
+
+    #[test]
+    fn a_popup_accepts_input_over_a_window_part_that_does_not() {
+        let mut w = Windows::default();
+        let size = Size::new(100.0, 100.0);
+        // The window accepts input only in its left half.
+        w.map(
+            id(1),
+            size,
+            vec![Rect::new(Point::new(0.0, 0.0), Size::new(50.0, 100.0))],
+            Point::new(50.0, 50.0),
+        );
+        assert_eq!(w.hit(Point::new(70.0, 20.0)), None);
+        w.add_popup(id(1), popup(1, None, (60, 10), 30.0, 30.0));
+        assert_eq!(
+            w.hit(Point::new(70.0, 20.0)),
+            Some((id(1), Point::new(70.0, 20.0)))
+        );
+    }
+
+    #[test]
+    fn a_higher_window_covers_a_lower_windows_popup() {
+        let mut w = one_window();
+        w.add_popup(id(1), popup(1, None, (90, 10), 50.0, 30.0));
+        let size = Size::new(100.0, 100.0);
+        // Window 2 on top, covering x 100..200.
+        w.map(id(2), size, full(size), Point::new(150.0, 50.0));
+        assert_eq!(
+            w.hit(Point::new(130.0, 20.0)),
+            Some((id(2), Point::new(30.0, 20.0)))
+        );
+        // Window 1's own part of the popup, over window 1, is still window 1.
+        assert_eq!(
+            w.hit(Point::new(95.0, 20.0)),
+            Some((id(1), Point::new(95.0, 20.0)))
+        );
+    }
+
+    #[test]
+    fn removing_a_popup_removes_the_popups_above_it_topmost_first() {
+        let mut w = one_window();
+        w.add_popup(id(1), popup(1, None, (0, 0), 10.0, 10.0));
+        w.add_popup(id(1), popup(2, Some(1), (0, 0), 10.0, 10.0));
+        w.add_popup(id(1), popup(3, Some(2), (0, 0), 10.0, 10.0));
+        w.add_popup(id(1), popup(4, None, (0, 0), 10.0, 10.0));
+        assert_eq!(w.window_of_popup(PopupId(3)), Some(id(1)));
+        assert_eq!(
+            w.remove_popup(id(1), PopupId(2)),
+            vec![PopupId(3), PopupId(2)]
+        );
+        assert_eq!(w.take_popups(id(1)), vec![PopupId(4), PopupId(1)]);
+        assert!(w.get(id(1)).unwrap().popups.is_empty());
     }
 }

@@ -12,6 +12,7 @@ mod data_device;
 mod descriptors;
 mod dmabuf;
 mod output;
+mod popup;
 mod release;
 mod seat;
 mod shm;
@@ -33,9 +34,9 @@ use thiserror::Error;
 use wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
 use wayland_server::{Display, DisplayHandle, ListeningSocket};
 
-use crate::canvas::{Point, Rect};
+use crate::canvas::Rect;
 use crate::render::formats::FormatPair;
-use crate::shell::{ClientInput, WindowCommand, WindowEvent, WindowId};
+use crate::shell::{ClientInput, PopupId, WindowCommand, WindowEvent, WindowId};
 
 pub use commit_queue::WaitId;
 pub use compositor::Transform;
@@ -185,6 +186,8 @@ pub struct ServerState {
     pub(crate) next_buffer: u64,
     next_wait: u64,
     pub(crate) xdg_surfaces: HashMap<ObjectId, XdgSurfaceData>,
+    /// Popups by their `xdg_surface` (popups data-model "PopupData").
+    pub(crate) popups: HashMap<ObjectId, popup::PopupData>,
     pub(crate) outputs: Vec<output::OutputEntry>,
     pub(crate) seat: seat::SeatState,
     /// Mapped windows and their root surface.
@@ -204,6 +207,7 @@ pub struct ServerState {
     next_window: u64,
     next_surface: u64,
     next_serial: u32,
+    next_popup: u64,
 }
 
 impl ServerState {
@@ -225,6 +229,11 @@ impl ServerState {
     pub(crate) fn new_window_id(&mut self) -> WindowId {
         self.next_window += 1;
         WindowId(self.next_window)
+    }
+
+    pub(crate) fn new_popup_id(&mut self) -> PopupId {
+        self.next_popup += 1;
+        PopupId(self.next_popup)
     }
 
     /// The scale applications should draw at, as an integer and in 120ths: 1 on every display
@@ -282,6 +291,7 @@ impl Server {
                 next_buffer: 0,
                 next_wait: 0,
                 xdg_surfaces: HashMap::new(),
+                popups: HashMap::new(),
                 outputs: Vec::new(),
                 seat: seat::SeatState::default(),
                 windows: HashMap::new(),
@@ -295,6 +305,7 @@ impl Server {
                 next_window: 0,
                 next_surface: 0,
                 next_serial: 0,
+                next_popup: 0,
             },
         })
     }
@@ -347,8 +358,10 @@ impl Server {
             .try_clone_to_owned()
     }
 
-    /// Window changes since the last call, in order.
+    /// Window changes since the last call, in order; waiting popup repositions come last, one
+    /// per popup (popups research P11).
     pub fn take_window_events(&mut self) -> Vec<WindowEvent> {
+        popup::report_repositions(&mut self.state);
         std::mem::take(&mut self.state.window_events)
     }
 
@@ -357,8 +370,8 @@ impl Server {
     pub fn take_damage(&mut self) -> Damage {
         let surfaces = std::mem::take(&mut self.state.damaged);
         let mut windows: Vec<WindowId> = Vec::new();
-        for (window, root) in &self.state.windows {
-            let tree = compositor::tree(&self.state, root);
+        for window in self.state.windows.keys() {
+            let tree = popup::window_surfaces(&self.state, *window);
             if surfaces.iter().any(|s| tree.contains(s)) {
                 windows.push(*window);
             }
@@ -370,22 +383,14 @@ impl Server {
         }
     }
 
-    /// The surfaces of a window in drawing order (back to front), in window coordinates. Empty
-    /// for unknown windows.
+    /// The surfaces of a window in drawing order (back to front), in window coordinates: its own
+    /// surfaces, then its shown popups. Empty for unknown windows.
     pub fn window_parts(&self, id: WindowId) -> Vec<SurfacePart> {
-        let Some(root) = self.state.windows.get(&id) else {
-            return Vec::new();
-        };
-        let origin = self.window_origin(root);
         let mut parts = Vec::new();
-        compositor::collect_parts(&self.state, root, origin, &mut parts);
+        for (root, origin) in popup::layers(&self.state, id) {
+            compositor::collect_parts(&self.state, &root, origin, &mut parts);
+        }
         parts
-    }
-
-    /// Window coordinates of a window's root surface origin: minus the geometry offset.
-    fn window_origin(&self, root: &ObjectId) -> Point {
-        let geometry = xdg_shell::geometry_of(&self.state, root);
-        Point::new(-geometry.origin.x, -geometry.origin.y)
     }
 
     /// Copies every newly committed buffer through `upload` (with the GL context current),
@@ -494,7 +499,7 @@ impl Server {
             return;
         }
         for id in windows {
-            if let Some(root) = self.state.windows.get(id).cloned() {
+            for (root, _) in popup::layers(&self.state, *id) {
                 compositor::complete_callbacks(&mut self.state, &root, time_ms);
             }
         }
@@ -513,10 +518,9 @@ impl Server {
             return false;
         }
         windows.iter().any(|id| {
-            self.state
-                .windows
-                .get(id)
-                .is_some_and(|root| compositor::has_callbacks(&self.state, root))
+            popup::layers(&self.state, *id)
+                .iter()
+                .any(|(root, _)| compositor::has_callbacks(&self.state, root))
         })
     }
 

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 561ba227148aa5fdb5482b222f29095311ef60ee21032d19e5791167118290a6 # shrinks to r = PopupRules { size: (1, 1), anchor_rect: IRect { x: 0, y: 0, w: 0, h: 0 }, anchor: None, gravity: None, adjust: Adjust(63), offset: (0, 0), reactive: false, parent_size: None }, (ax, ay) = (0, 1)

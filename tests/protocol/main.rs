@@ -12,6 +12,7 @@ mod harness;
 mod input;
 mod misbehaving;
 mod outputs;
+mod popups;
 mod surfaces;
 mod syncobj;
 mod wm;

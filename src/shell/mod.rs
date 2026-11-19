@@ -11,15 +11,19 @@
 
 mod cursor;
 mod geometry;
+mod popups;
+mod positioner;
 mod route;
 mod windows;
 
 pub use cursor::{AppCursor, CursorName};
 pub use geometry::*;
+pub use popups::{Popup, PopupId, Shown};
+pub use positioner::{Adjust, Anchor8, IRect, PopupRules, place};
 pub use route::ClientInput;
 pub use windows::*;
 
-use route::{Grab, Op, Operation, Router};
+use route::{Grab, Op, Operation, PopupGrab, Router};
 
 use crate::canvas::{Camera, Layout, LayoutEntry, Point, Rect, Size, Vector, ViewerId};
 use crate::input::bindings::{Action, Bindings, PointerAction};
@@ -49,13 +53,14 @@ pub enum WindowEvent {
         maximized: bool,
         fullscreen: bool,
     },
-    /// A toplevel showed its first content.
+    /// A toplevel showed its first content. `app`: the application it belongs to.
     Mapped {
         id: WindowId,
         size: Size,
         input: Vec<Rect>,
         limits: SizeLimits,
         parent: Option<WindowId>,
+        app: AppId,
     },
     /// Its geometry size, input shape or size limits changed, or it applied the newest
     /// configure the shell asked for (`configured`).
@@ -84,6 +89,40 @@ pub enum WindowEvent {
     /// The cursor the application of window `id` asks for while the pointer is over it, sent
     /// only when it changes (cursor-shapes research C3). Ignored unless the pointer is in `id`.
     CursorChanged { id: WindowId, cursor: AppCursor },
+    /// A popup made its initial commit; the shell answers [`WindowCommand::PlacePopup`] or
+    /// [`WindowCommand::DismissPopup`] (popups research P12). `parent: None`: the window itself.
+    /// `grab`: the application asked for a grab and its serial passed the server's check.
+    PopupRequested {
+        id: PopupId,
+        window: WindowId,
+        parent: Option<PopupId>,
+        rules: PopupRules,
+        grab: bool,
+    },
+    /// The application asked to place a shown popup again (research P11); answered with a
+    /// [`WindowCommand::PlacePopup`] carrying `token`.
+    PopupRepositionRequested {
+        id: PopupId,
+        rules: PopupRules,
+        token: u32,
+    },
+    /// A popup showed its first content after acking a placement: `at` relative to its parent's
+    /// window geometry, `input` in popup coordinates.
+    PopupMapped {
+        id: PopupId,
+        at: (i32, i32),
+        size: Size,
+        input: Vec<Rect>,
+    },
+    /// A later commit changed a shown popup's position, size or input shape.
+    PopupUpdated {
+        id: PopupId,
+        at: (i32, i32),
+        size: Size,
+        input: Vec<Rect>,
+    },
+    /// The application hid or destroyed a popup (or its surface); its children went first.
+    PopupUnmapped { id: PopupId },
 }
 
 /// States the shell asks a window to have (`activated` follows keyboard focus).
@@ -105,6 +144,15 @@ pub enum WindowCommand {
     },
     /// Ask the application to close the window.
     Close { window: WindowId },
+    /// Place a popup at `at` (relative to its parent's window geometry); `token` answers a
+    /// reposition (popups research P11, P12).
+    PlacePopup {
+        id: PopupId,
+        at: IRect,
+        token: Option<u32>,
+    },
+    /// Dismiss a popup (`popup_done`); it is never shown again (FR-012). Sent topmost first.
+    DismissPopup { id: PopupId },
 }
 
 /// The pointer cursor the shell wants (research W11); `App` maps it to the backend's cursor.
@@ -122,6 +170,14 @@ pub enum CursorShape {
     Named(CursorName),
     /// No pointer: the application under it hid it, and no gesture runs (FR-008).
     Hidden,
+}
+
+/// Which popups `Shell::dismiss_popups` closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dismiss {
+    All,
+    /// One application's (a press outside it, or a new grab elsewhere).
+    App(AppId),
 }
 
 /// One display's viewer (research S14); its home view is the layout's.
@@ -166,6 +222,11 @@ pub struct Shell {
     /// The cursor the application of the entered window asked for since the pointer entered
     /// it (cursor-shapes research C3); forgotten when the pointer leaves that window.
     app_cursor: Option<(WindowId, AppCursor)>,
+    /// Input from closing popups on a path with no output at hand (maximize, fullscreen); handed
+    /// out at the end of `handle`, `apply` or `remove_viewer` (popups research P8).
+    popup_input: Vec<ClientInput>,
+    /// A popup grab ended during this call: the pointer is re-targeted at its end (FR-013).
+    grab_ended: bool,
     dirty: bool,
 }
 
@@ -235,6 +296,8 @@ impl Shell {
             maximized_on: Vec::new(),
             initial: Vec::new(),
             app_cursor: None,
+            popup_input: Vec::new(),
+            grab_ended: false,
             dirty: true,
         }
     }
@@ -481,6 +544,7 @@ impl Shell {
         if self.slot(id).is_none() {
             return out;
         }
+        self.dismiss_popups(Dismiss::All, &mut out);
         self.exit_fullscreen_on(id, false);
         if self.active == Some(id) {
             self.router.grab = None;
@@ -494,6 +558,7 @@ impl Shell {
         }
         self.sync_active();
         self.dirty = true;
+        out.append(&mut self.popup_input);
         out
     }
 
@@ -567,7 +632,11 @@ impl Shell {
                 input,
                 limits,
                 parent,
-            } => self.mapped(id, size, input, limits, parent, &mut out),
+                app,
+            } => {
+                self.mapped(id, size, input, limits, parent, &mut out);
+                self.windows.set_app(id, app);
+            }
             WindowEvent::Updated {
                 id,
                 size,
@@ -575,8 +644,21 @@ impl Shell {
                 limits,
                 configured,
             } => {
+                let before = self.windows.get(id).map(|w| w.rect());
                 self.windows.update(id, size, input);
                 self.windows.set_limits(id, limits);
+                if let Some(win) = self.windows.get(id)
+                    && before.is_some_and(|r| r != win.rect())
+                {
+                    // The parent changed: its reactive popups are placed again (research P10).
+                    let reactive: Vec<(PopupId, Option<u32>)> = win
+                        .popups
+                        .iter()
+                        .filter(|p| p.parent.is_none() && p.rules.reactive)
+                        .map(|p| (p.id, None))
+                        .collect();
+                    self.place_again(id, reactive);
+                }
                 if configured && let Some(i) = self.settling.iter().position(|w| *w == id) {
                     // The size asked for after a resize or a restore arrived: back to the
                     // top-left anchor, and the application chooses its size again.
@@ -614,6 +696,29 @@ impl Shell {
                 }
             }
             WindowEvent::MaximizeRequested { .. } | WindowEvent::FullscreenRequested { .. } => {}
+            WindowEvent::PopupRequested {
+                id,
+                window,
+                parent,
+                rules,
+                grab,
+            } => self.popup_requested(id, window, parent, rules, grab, &mut out),
+            WindowEvent::PopupRepositionRequested { id, rules, token } => {
+                self.popup_repositioned(id, rules, token);
+            }
+            WindowEvent::PopupMapped {
+                id,
+                at,
+                size,
+                input,
+            }
+            | WindowEvent::PopupUpdated {
+                id,
+                at,
+                size,
+                input,
+            } => self.popup_shown(id, Shown { at, size, input }, &mut out),
+            WindowEvent::PopupUnmapped { id } => self.popup_gone(id, &mut out),
             WindowEvent::CursorChanged { id, cursor } => {
                 if self.router.entered == Some(id) && self.router.operation.is_none() {
                     self.app_cursor = Some((id, cursor));
@@ -636,6 +741,15 @@ impl Shell {
                 }
                 if self.router.grab.as_ref().is_some_and(|g| g.window == id) {
                     self.router.grab = None;
+                }
+                // Its popups went with it; so does a grab of their chain.
+                if self
+                    .router
+                    .popup_grab
+                    .as_ref()
+                    .is_some_and(|g| g.window == id)
+                {
+                    self.router.popup_grab = None;
                 }
                 if self
                     .router
@@ -661,7 +775,262 @@ impl Shell {
         }
         self.dirty = true;
         self.focus_changed(before, &mut out);
+        out.append(&mut self.popup_input);
+        self.after_grab(&mut out);
         out
+    }
+
+    /// A popup made its initial commit: place it against the chosen viewer's view (popups
+    /// research P3, P4), or dismiss it; a grabbing popup joins or starts the grab (P6).
+    fn popup_requested(
+        &mut self,
+        id: PopupId,
+        window: WindowId,
+        parent: Option<PopupId>,
+        rules: PopupRules,
+        grab: bool,
+        out: &mut Vec<ClientInput>,
+    ) {
+        let gesture = self.router.operation.is_some()
+            || self.router.pan_button.is_some()
+            || self.pan_viewer.is_some();
+        let Some(app) = self.windows.get(window).map(|w| w.app) else {
+            self.commands.push(WindowCommand::DismissPopup { id });
+            return;
+        };
+        if grab && gesture {
+            // The application cannot have asked in response to the user (spec Edge Cases).
+            self.commands.push(WindowCommand::DismissPopup { id });
+            return;
+        }
+        if grab
+            && let Some(g) = &self.router.popup_grab
+            && (g.app != app
+                || g.window != window
+                || parent.is_none_or(|pp| g.chain.last() != Some(&pp)))
+        {
+            // A new chain: the old one closes first.
+            let old = g.app;
+            self.dismiss_popups(Dismiss::App(old), out);
+        }
+        let Some(at) = self.placement(window, parent, &rules) else {
+            // Its parent is gone already.
+            self.commands.push(WindowCommand::DismissPopup { id });
+            return;
+        };
+        self.windows.add_popup(
+            window,
+            Popup {
+                id,
+                parent,
+                rules,
+                grab,
+                placed: at,
+                shown: None,
+            },
+        );
+        self.commands.push(WindowCommand::PlacePopup {
+            id,
+            at,
+            token: None,
+        });
+        if grab {
+            match &mut self.router.popup_grab {
+                Some(g) => g.chain.push(id),
+                None => {
+                    self.router.popup_grab = Some(PopupGrab {
+                        app,
+                        window,
+                        chain: vec![id],
+                        keyboard: None,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Where a popup of `window` with `rules` goes, against its parent (the window or popup
+    /// `parent`) and the chosen viewer's view (popups research P3, P4); `None` if the window or
+    /// the parent is gone.
+    fn placement(
+        &self,
+        window: WindowId,
+        parent: Option<PopupId>,
+        rules: &PopupRules,
+    ) -> Option<IRect> {
+        let win = self.windows.get(window)?;
+        let parent_origin = match parent {
+            None => Point::new(0.0, 0.0),
+            Some(pp) => win.placed_origin(pp)?,
+        };
+        let origin = win.origin + (parent_origin - Point::new(0.0, 0.0));
+        let views: Vec<(ViewerId, Rect)> = self
+            .viewers
+            .iter()
+            .map(|s| (s.id, view_rect_of(&s.viewer)))
+            .collect();
+        let pointer = self.pointer().map(|(v, _)| v);
+        let area = popups::constraint_view(&views, pointer, win.extent())
+            .map(|view| popups::area_in(view, origin));
+        Some(place(rules, area))
+    }
+
+    /// Places popups of `window` again, each with its answer token, and after each one its
+    /// reactive children (popups research P10, P11).
+    fn place_again(&mut self, window: WindowId, first: Vec<(PopupId, Option<u32>)>) {
+        let mut work = first;
+        let mut i = 0;
+        while let Some((id, token)) = work.get(i).copied() {
+            i += 1;
+            let Some(win) = self.windows.get(window) else {
+                return;
+            };
+            let Some(p) = win.popup(id) else {
+                continue;
+            };
+            let (parent, rules) = (p.parent, p.rules);
+            let children: Vec<(PopupId, Option<u32>)> = win
+                .popups
+                .iter()
+                .filter(|c| c.parent == Some(id) && c.rules.reactive)
+                .map(|c| (c.id, None))
+                .collect();
+            let Some(at) = self.placement(window, parent, &rules) else {
+                continue;
+            };
+            if let Some(p) = self.windows.popup_mut(window, id) {
+                p.placed = at;
+            }
+            self.commands
+                .push(WindowCommand::PlacePopup { id, at, token });
+            work.extend(children);
+        }
+    }
+
+    /// The application moved a popup (`xdg_popup.reposition`): new rules, placed again and
+    /// answered with its token.
+    fn popup_repositioned(&mut self, id: PopupId, rules: PopupRules, token: u32) {
+        let Some(window) = self.windows.window_of_popup(id) else {
+            return;
+        };
+        if let Some(p) = self.windows.popup_mut(window, id) {
+            p.rules = rules;
+        }
+        self.place_again(window, vec![(id, Some(token))]);
+    }
+
+    /// The application showed a popup, or changed where or how large it is.
+    fn popup_shown(&mut self, id: PopupId, shown: Shown, out: &mut Vec<ClientInput>) {
+        let Some(window) = self.windows.window_of_popup(id) else {
+            return;
+        };
+        let size = shown.size;
+        let Some(p) = self.windows.popup_mut(window, id) else {
+            return;
+        };
+        let resized = p.shown.as_ref().is_some_and(|old| old.size != size);
+        p.shown = Some(shown);
+        if resized && let Some(win) = self.windows.get(window) {
+            // The parent changed size: its reactive popups are placed again (FR-005, P10).
+            let reactive: Vec<(PopupId, Option<u32>)> = win
+                .popups
+                .iter()
+                .filter(|c| c.parent == Some(id) && c.rules.reactive)
+                .map(|c| (c.id, None))
+                .collect();
+            self.place_again(window, reactive);
+        }
+        self.sync_popup_keyboard(out);
+    }
+
+    /// The application hid or destroyed a popup: it and the popups above it are gone.
+    fn popup_gone(&mut self, id: PopupId, out: &mut Vec<ClientInput>) {
+        let Some(window) = self.windows.window_of_popup(id) else {
+            return;
+        };
+        let gone = self.windows.remove_popup(window, id);
+        if let Some(g) = &mut self.router.popup_grab {
+            g.chain.retain(|c| !gone.contains(c));
+        }
+        self.sync_popup_keyboard(out);
+    }
+
+    /// Closes popups: all of them, or one application's (popups research P8). Each gets a
+    /// `DismissPopup`, the topmost first; a grab whose popups closed ends.
+    fn dismiss_popups(&mut self, scope: Dismiss, out: &mut Vec<ClientInput>) {
+        let windows: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|w| match scope {
+                Dismiss::All => true,
+                Dismiss::App(app) => w.app == app,
+            })
+            .map(|w| w.id)
+            .collect();
+        for window in windows {
+            for id in self.windows.take_popups(window) {
+                self.commands.push(WindowCommand::DismissPopup { id });
+                self.dirty = true;
+            }
+        }
+        if let Some(g) = &mut self.router.popup_grab
+            && match scope {
+                Dismiss::All => true,
+                Dismiss::App(app) => g.app == app,
+            }
+        {
+            g.chain.clear();
+        }
+        self.sync_popup_keyboard(out);
+    }
+
+    /// Once a grab is over, the pointer enters what is under it at once (FR-013), unless a
+    /// RubickWay gesture now has it; called at the end of `handle` and `apply`.
+    fn after_grab(&mut self, out: &mut Vec<ClientInput>) {
+        if std::mem::take(&mut self.grab_ended)
+            && self.router.operation.is_none()
+            && self.pan_viewer.is_none()
+            && let Some(p) = self.pointer_canvas()
+        {
+            self.retarget(p, false, out);
+        }
+    }
+
+    /// Closes every popup on a path with no output at hand; its input waits in `popup_input`.
+    fn close_popups(&mut self) {
+        let mut out = Vec::new();
+        self.dismiss_popups(Dismiss::All, &mut out);
+        self.popup_input.append(&mut out);
+    }
+
+    /// Gives the keyboard to the grab's topmost shown popup while its window is focused, or back
+    /// to the window; ends a grab whose chain is empty (popups research P7).
+    fn sync_popup_keyboard(&mut self, out: &mut Vec<ClientInput>) {
+        let Some(g) = &self.router.popup_grab else {
+            return;
+        };
+        let focused = self.router.viewer_focused && self.windows.focus() == Some(g.window);
+        let top = self.windows.get(g.window).and_then(|w| {
+            g.chain
+                .iter()
+                .rev()
+                .copied()
+                .find(|id| w.popup(*id).is_some_and(|p| p.shown.is_some()))
+        });
+        let want = top.filter(|_| focused);
+        let (window, had, empty) = (g.window, g.keyboard, g.chain.is_empty());
+        if want != had {
+            out.push(ClientInput::PopupKeyboard {
+                window,
+                popup: want,
+            });
+        }
+        if empty {
+            self.router.popup_grab = None;
+            self.grab_ended = true;
+        } else if let Some(g) = &mut self.router.popup_grab {
+            g.keyboard = want;
+        }
     }
 
     /// A window that asked for an initial state made its initial commit: answer with its
@@ -779,6 +1148,8 @@ impl Shell {
         let Some(viewer) = self.window_viewer(id) else {
             return;
         };
+        // Popups close on any maximize change, whoever asked (FR-010).
+        self.close_popups();
         if let Some((fs_viewer, fs)) = self.fs_of(id) {
             // Maximized under fullscreen: shown when fullscreen ends.
             self.windows.set_mode(
@@ -820,6 +1191,7 @@ impl Shell {
         let Some(Mode::Maximized { saved }) = self.windows.get(id).map(|w| w.mode) else {
             return;
         };
+        self.close_popups();
         self.windows.set_mode(id, Mode::Normal);
         self.maximized_on.retain(|(w, _)| *w != id);
         if let Some((viewer, _)) = self.fs_of(id) {
@@ -887,6 +1259,8 @@ impl Shell {
             Some((on, _)) => self.exit_fullscreen_on(on, true),
             None => {}
         }
+        // Popups close on any fullscreen change, whoever asked (FR-010).
+        self.close_popups();
         // One fullscreen window per viewer: the earlier one leaves first, so the saved view is
         // always the one from before any fullscreen.
         self.exit_fullscreen_on(viewer, true);
@@ -936,6 +1310,7 @@ impl Shell {
         if restore_camera {
             slot.viewer.set_camera(fs.saved_camera);
         }
+        self.close_popups();
         self.dirty = true;
         let Some(mode) = self.windows.get(fs.window).map(|w| w.mode) else {
             return;
@@ -1124,8 +1499,17 @@ impl Shell {
     }
 
     /// The window accepting input at canvas point `p`; while a window is fullscreen on the
-    /// active viewer, only it.
+    /// active viewer, only it; during a popup grab, only the grabbing application's (P6).
     fn hit(&self, p: Point) -> Option<(WindowId, Point)> {
+        let hit = self.hit_any(p);
+        match &self.router.popup_grab {
+            Some(g) => hit.filter(|(id, _)| self.windows.get(*id).is_some_and(|w| w.app == g.app)),
+            None => hit,
+        }
+    }
+
+    /// [`Shell::hit`] without the grab's limit, for RubickWay's own bindings.
+    fn hit_any(&self, p: Point) -> Option<(WindowId, Point)> {
         match self.active_fs() {
             Some(fs) => self
                 .windows
@@ -1148,6 +1532,8 @@ impl Shell {
     /// Starts an operation: the pointer leaves the window, which gets no pointer input until
     /// the operation ends (research W3).
     fn start_operation(&mut self, op: Op, buttons: Vec<u32>, out: &mut Vec<ClientInput>) {
+        // Popups close before a move or resize (FR-010).
+        self.dismiss_popups(Dismiss::All, out);
         self.router.grab = None;
         self.leave(out);
         self.router.operation = Some(Operation { op, buttons });
@@ -1328,6 +1714,8 @@ impl Shell {
     pub fn handle(&mut self, event: &InputEvent) -> (Effect, Vec<ClientInput>) {
         let mut out = Vec::new();
         let panned = self.pan_viewer.is_some();
+        // Any view that changes during the event closes the popups (research P8).
+        let cameras: Vec<Camera> = self.viewers.iter().map(|s| s.viewer.camera()).collect();
         let effect = match *event {
             InputEvent::PointerEnter { pos } | InputEvent::PointerMotion { pos } => {
                 // An absolute position on the active viewer: keep the layout's pointer in step.
@@ -1432,6 +1820,16 @@ impl Shell {
         if panned && self.pan_viewer.is_none() {
             self.follow_pointer(&mut out);
         }
+        if self
+            .viewers
+            .iter()
+            .map(|s| s.viewer.camera())
+            .ne(cameras.iter().copied())
+        {
+            self.dismiss_popups(Dismiss::All, &mut out);
+        }
+        out.append(&mut self.popup_input);
+        self.after_grab(&mut out);
         (effect, out)
     }
 
@@ -1481,9 +1879,14 @@ impl Shell {
         self.windows.focus().filter(|_| self.router.viewer_focused)
     }
 
-    fn focus_changed(&self, before: Option<WindowId>, out: &mut Vec<ClientInput>) {
+    fn focus_changed(&mut self, before: Option<WindowId>, out: &mut Vec<ClientInput>) {
         let now = self.windows.focus();
-        if now == before || !self.router.viewer_focused {
+        if now == before {
+            return;
+        }
+        // Popups close when the focus moves to another window (FR-010), before it moves.
+        self.dismiss_popups(Dismiss::All, out);
+        if !self.router.viewer_focused {
             return;
         }
         match now {
@@ -1578,6 +1981,11 @@ impl Shell {
         pressed: bool,
         out: &mut Vec<ClientInput>,
     ) -> Effect {
+        if !pressed && let Some(i) = self.router.swallowed.iter().position(|b| *b == code) {
+            // The release of a press that closed a grab's popups (FR-009).
+            self.router.swallowed.remove(i);
+            return Effect::default();
+        }
         if let Some(operation) = &mut self.router.operation {
             // Further presses are swallowed; the last release ends the operation.
             if pressed {
@@ -1609,9 +2017,17 @@ impl Shell {
                 out.push(ClientInput::PointerFrame { window });
                 return Effect::default();
             }
-            let hit = self.pointer_canvas().and_then(|p| self.hit(p));
+            let pointer = self.pointer_canvas();
+            let hit = pointer.and_then(|p| self.hit(p));
+            // Bindings act on any window, also during a popup grab (popups research P6).
+            let binding_hit = pointer.and_then(|p| self.hit_any(p));
+            let action = self.bindings.pointer_lookup(self.router.mods, button);
+            if action.is_some() {
+                // Popups close before RubickWay acts; the press is not swallowed (FR-010).
+                self.dismiss_popups(Dismiss::All, out);
+            }
             // The pointer bindings (FR-032, contracts/config.md "Pointer combinations").
-            match (self.bindings.pointer_lookup(self.router.mods, button), hit) {
+            match (action, binding_hit) {
                 (Some(PointerAction::MoveWindow), Some((window, _))) => {
                     // Focus, raise, move (FR-002); a fullscreen or maximized window gets its
                     // earlier size first.
@@ -1635,6 +2051,16 @@ impl Shell {
                 }
                 (None, _) => {}
             }
+            if let Some(g) = &self.router.popup_grab
+                && hit.is_none()
+            {
+                // A press outside the grabbing application closes its popups and goes nowhere
+                // (FR-009); its release is swallowed too.
+                let app = g.app;
+                self.dismiss_popups(Dismiss::App(app), out);
+                self.router.swallowed.push(code);
+                return Effect::default();
+            }
             // An ordinary click.
             let Some((window, local)) = hit else {
                 // The background: left pans (or leaves fullscreen), other buttons do nothing;
@@ -1645,6 +2071,10 @@ impl Shell {
                 return Effect::default();
             };
             let before = self.windows.focus();
+            if before != Some(window) {
+                // The click moves the keyboard to another window: popups close first (FR-010).
+                self.dismiss_popups(Dismiss::All, out);
+            }
             self.windows.raise_and_focus(window);
             self.dirty = true;
             self.focus_changed(before, out);
@@ -1688,6 +2118,8 @@ impl Shell {
     /// A pan press: with a fullscreen window on the active viewer it leaves fullscreen and is
     /// consumed (contracts/input.md); otherwise the active viewer pans until `code` is released.
     fn pan_or_leave_fullscreen(&mut self, code: u32, out: &mut Vec<ClientInput>) {
+        // Popups close before a pan or leaving fullscreen (FR-010).
+        self.dismiss_popups(Dismiss::All, out);
         if self.active_fs().is_some() {
             self.exit_fullscreen(true);
             return;
@@ -1734,6 +2166,13 @@ impl Shell {
                 .and_then(|p| self.hit(p))
                 .map(|(id, _)| id),
         };
+        if self.router.popup_grab.is_some()
+            && target.is_none()
+            && !self.bindings.mod_held(self.router.mods)
+        {
+            // Scrolling outside the grabbing application does nothing (contracts/input.md).
+            return;
+        }
         if self.active_fs().is_some()
             && (self.bindings.mod_held(self.router.mods) || target.is_none())
         {
@@ -1774,6 +2213,8 @@ impl Shell {
                 self.router.quit.cancel();
             }
             if let Some(action) = action {
+                // Popups close before any binding acts (FR-010, research P8).
+                self.dismiss_popups(Dismiss::All, out);
                 self.router.consumed_keys.push(keycode);
                 let operating = self.router.operation.is_some();
                 return match action {

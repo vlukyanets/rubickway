@@ -1,16 +1,15 @@
-//! `xdg_wm_base`, `xdg_surface`, `xdg_toplevel`, `xdg_popup`, `xdg_positioner` (research R9).
+//! `xdg_wm_base`, `xdg_surface`, `xdg_toplevel`, `xdg_positioner` (research R9); `xdg_popup`
+//! lives in `popup.rs`.
 //!
 //! A toplevel maps when its surface commits a buffer after acking the first configure; the
 //! server then emits `WindowEvent::Mapped` and, on later changes, `Updated` / `Unmapped`.
 //! Window-management requests (move and resize with a checked serial, maximize, fullscreen)
 //! become `WindowEvent`s for the shell, which answers with `WindowCommand`s: configures carry
 //! the size and states it wants, with one new size outstanding at a time (window-management
-//! research W1-W5, W13, W14). Minimize and the window menu are ignored; popups are dismissed
-//! at once.
+//! research W1-W5, W13, W14). Minimize and the window menu are ignored.
 
 use std::sync::Mutex;
 
-use wayland_protocols::xdg::shell::server::xdg_popup::{self, XdgPopup};
 use wayland_protocols::xdg::shell::server::xdg_positioner::{self, XdgPositioner};
 use wayland_protocols::xdg::shell::server::xdg_surface::{self, XdgSurface};
 use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, XdgToplevel};
@@ -21,9 +20,13 @@ use wayland_server::{
 };
 
 use super::compositor::{self, Role};
-use super::{ServerState, output};
+use super::dmabuf::client_number;
+use super::{ServerState, output, popup};
 use crate::canvas::{Point, Rect, Size, Vector};
-use crate::shell::{Edges, SizeLimits, States, WindowCommand, WindowEvent, WindowId};
+use crate::shell::{
+    Adjust, Anchor8, AppId, Edges, IRect, PopupRules, SizeLimits, States, WindowCommand,
+    WindowEvent, WindowId,
+};
 
 pub(crate) fn create_global(dh: &DisplayHandle) {
     dh.create_global::<ServerState, XdgWmBase, ()>(6, ());
@@ -116,11 +119,42 @@ fn push_state(states: &mut Vec<u8>, state: xdg_toplevel::State) {
     states.extend_from_slice(&(state as u32).to_ne_bytes());
 }
 
-/// `set_size` and `set_anchor_rect` seen, needed for a complete positioner.
+/// Everything an `xdg_positioner` was told (popups data-model "PositionerState"); complete once
+/// `set_size` and `set_anchor_rect` were seen.
 #[derive(Default)]
 pub(crate) struct PositionerState {
-    size: bool,
-    anchor_rect: bool,
+    size: Option<(i32, i32)>,
+    anchor_rect: Option<IRect>,
+    rules: PopupRules,
+    /// `set_parent_configure`: accepted, not used (popups research P10).
+    parent_configure: Option<u32>,
+}
+
+impl PositionerState {
+    /// The rules to copy into a popup, if the positioner is complete.
+    pub(crate) fn rules(&self) -> Option<PopupRules> {
+        Some(PopupRules {
+            size: self.size?,
+            anchor_rect: self.anchor_rect?,
+            ..self.rules
+        })
+    }
+}
+
+/// The rules of `positioner`, if it is complete.
+pub(crate) fn positioner_rules(positioner: &XdgPositioner) -> Option<PopupRules> {
+    positioner
+        .data::<Mutex<PositionerState>>()
+        .and_then(|m| m.lock().unwrap_or_else(|e| e.into_inner()).rules())
+}
+
+/// An anchor or gravity value as the protocol numbers it.
+fn anchor_value<E: Into<u32>>(value: WEnum<E>) -> Option<Anchor8> {
+    let raw = match value {
+        WEnum::Value(v) => v.into(),
+        WEnum::Unknown(v) => v,
+    };
+    Anchor8::from_u32(raw)
 }
 
 fn xdg_of_surface<'a>(state: &'a ServerState, surface: &ObjectId) -> Option<&'a XdgSurfaceData> {
@@ -145,8 +179,8 @@ pub(crate) fn geometry_of(state: &ServerState, root: &ObjectId) -> Rect {
     }
 }
 
-/// Size and input shape (window coordinates) of the window at `root`.
-fn window_shape(state: &ServerState, root: &ObjectId) -> (Size, Vec<Rect>) {
+/// Size and input shape (window coordinates) of the window (or popup) at `root`.
+pub(crate) fn window_shape(state: &ServerState, root: &ObjectId) -> (Size, Vec<Rect>) {
     let geometry = geometry_of(state, root);
     let shift = Point::new(0.0, 0.0) - geometry.origin;
     let input = compositor::input_shape(state, root)
@@ -208,6 +242,15 @@ fn send_configure(state: &mut ServerState, xdg_id: &ObjectId, from_shell: bool) 
     cfg.deferred = false;
 }
 
+/// The `xdg_surface.configure` that follows a popup's `configure` (popups research P12).
+pub(crate) fn send_popup_configure(state: &mut ServerState, xdg_id: &ObjectId, serial: u32) {
+    if let Some(x) = state.xdg_surfaces.get_mut(xdg_id) {
+        x.resource.configure(serial);
+        x.serials.push(serial);
+        x.configure_sent = true;
+    }
+}
+
 /// After an ack: sends a configure deferred behind the acked size configure.
 fn acked(state: &mut ServerState, xdg_id: &ObjectId, serial: u32) {
     let Some(x) = state.xdg_surfaces.get_mut(xdg_id) else {
@@ -264,6 +307,8 @@ pub(crate) fn command(state: &mut ServerState, commands: &[WindowCommand]) {
                     toplevel.close();
                 }
             }
+            WindowCommand::PlacePopup { id, at, token } => popup::place(state, *id, *at, *token),
+            WindowCommand::DismissPopup { id } => popup::dismiss(state, *id),
         }
     }
 }
@@ -386,6 +431,10 @@ pub(crate) fn tree_committed(
         x.geometry = capture.geometry;
         x.limits = capture.limits;
     }
+    if matches!(x.role, XdgRole::Popup) {
+        popup::committed(state, &xdg_id, root, has_buffer);
+        return;
+    }
     if !matches!(x.role, XdgRole::Toplevel(_)) {
         return;
     }
@@ -474,6 +523,7 @@ fn map(state: &mut ServerState, xdg_id: &ObjectId, root: &ObjectId) {
     x.window = Some(id);
     let limits = x.limits;
     x.reported = Some((size, input.clone(), limits));
+    let app = AppId(x.resource.client().map_or(0, |c| client_number(&c)));
     tracing::info!("window {} opened: {} \"{}\"", id.0, x.app_id, x.title);
     state.windows.insert(id, root.clone());
     state.window_events.push(WindowEvent::Mapped {
@@ -482,6 +532,7 @@ fn map(state: &mut ServerState, xdg_id: &ObjectId, root: &ObjectId) {
         input,
         limits,
         parent,
+        app,
     });
     // The displays showing it are told by `Server::set_window_outputs`.
     compositor::announce_scale(state, root);
@@ -510,6 +561,8 @@ fn unmap(state: &mut ServerState, xdg_id: &ObjectId) {
     x.wants_fullscreen = false;
     let parent = x.parent.take();
     tracing::info!("window {} closed", id.0);
+    // While the window still has its layers: they leave its outputs.
+    popup::window_gone(state, xdg_id);
     state.windows.remove(&id);
     state.window_outputs.remove(&id);
     // Its children get its own parent (xdg_toplevel.set_parent).
@@ -522,9 +575,10 @@ fn unmap(state: &mut ServerState, xdg_id: &ObjectId) {
     state.dirty = true;
 }
 
-/// A `wl_surface` was destroyed: unmap its window, if any.
+/// A `wl_surface` was destroyed: unmap its window, or end its popup, if any.
 pub(crate) fn surface_destroyed(state: &mut ServerState, surface: &ObjectId) {
     if let Some(xdg_id) = xdg_id_of_surface(state, surface) {
+        popup::surface_destroyed(state, &xdg_id);
         unmap(state, &xdg_id);
     }
 }
@@ -632,20 +686,61 @@ impl Dispatch<XdgPositioner, Mutex<PositionerState>> for ServerState {
         _: &mut DataInit<'_, Self>,
     ) {
         let mut p = data.lock().unwrap_or_else(|e| e.into_inner());
+        let invalid = |what: &str| resource.post_error(xdg_positioner::Error::InvalidInput, what);
         match request {
             xdg_positioner::Request::SetSize { width, height } => {
                 if width < 1 || height < 1 {
-                    resource.post_error(xdg_positioner::Error::InvalidInput, "size below 1");
+                    invalid("size below 1");
                 } else {
-                    p.size = true;
+                    p.size = Some((width, height));
                 }
             }
-            xdg_positioner::Request::SetAnchorRect { width, height, .. } => {
+            xdg_positioner::Request::SetAnchorRect {
+                x,
+                y,
+                width,
+                height,
+            } => {
                 if width < 0 || height < 0 {
-                    resource.post_error(xdg_positioner::Error::InvalidInput, "negative anchor");
+                    invalid("negative anchor");
                 } else {
-                    p.anchor_rect = true;
+                    p.anchor_rect = Some(IRect::new(x, y, width, height));
                 }
+            }
+            xdg_positioner::Request::SetAnchor { anchor } => match anchor_value(anchor) {
+                Some(a) => p.rules.anchor = a,
+                None => invalid("not an anchor value"),
+            },
+            xdg_positioner::Request::SetGravity { gravity } => match anchor_value(gravity) {
+                Some(g) => p.rules.gravity = g,
+                None => invalid("not a gravity value"),
+            },
+            xdg_positioner::Request::SetConstraintAdjustment {
+                constraint_adjustment,
+            } => {
+                let bits = match constraint_adjustment {
+                    WEnum::Value(v) => v.into(),
+                    WEnum::Unknown(v) => v,
+                };
+                match Adjust::from_bits(bits) {
+                    Some(a) => p.rules.adjust = a,
+                    None => invalid("not a constraint adjustment"),
+                }
+            }
+            xdg_positioner::Request::SetOffset { x, y } => p.rules.offset = (x, y),
+            xdg_positioner::Request::SetReactive => p.rules.reactive = true,
+            xdg_positioner::Request::SetParentSize {
+                parent_width,
+                parent_height,
+            } => {
+                if parent_width < 0 || parent_height < 0 {
+                    invalid("negative parent size");
+                } else {
+                    p.rules.parent_size = Some((parent_width, parent_height));
+                }
+            }
+            xdg_positioner::Request::SetParentConfigure { serial } => {
+                p.parent_configure = Some(serial);
             }
             _ => {}
         }
@@ -685,8 +780,12 @@ impl Dispatch<XdgSurface, ()> for ServerState {
                     x.role = XdgRole::Toplevel(toplevel);
                 }
             }
-            xdg_surface::Request::GetPopup { id, positioner, .. } => {
-                let popup = data_init.init(id, ());
+            xdg_surface::Request::GetPopup {
+                id,
+                parent,
+                positioner,
+            } => {
+                let popup = data_init.init(id, xdg_id.clone());
                 let Some(x) = state.xdg_surfaces.get(&xdg_id) else {
                     return;
                 };
@@ -698,17 +797,23 @@ impl Dispatch<XdgSurface, ()> for ServerState {
                     return;
                 }
                 let (surface, wm_base) = (x.surface.clone(), x.wm_base.clone());
-                let complete = positioner
-                    .data::<Mutex<PositionerState>>()
-                    .map(|m| {
-                        let p = m.lock().unwrap_or_else(|e| e.into_inner());
-                        p.size && p.anchor_rect
-                    })
-                    .unwrap_or(false);
-                if !complete {
+                let Some(rules) = positioner_rules(&positioner) else {
                     wm_base.post_error(
                         xdg_wm_base::Error::InvalidPositioner,
                         "the positioner has no size or anchor rectangle",
+                    );
+                    return;
+                };
+                let parent = parent.map(|p| p.id());
+                if let Some(p) = &parent
+                    && state
+                        .xdg_surfaces
+                        .get(p)
+                        .is_none_or(|px| matches!(px.role, XdgRole::None))
+                {
+                    wm_base.post_error(
+                        xdg_wm_base::Error::InvalidPopupParent,
+                        "the popup's parent has no role",
                     );
                     return;
                 }
@@ -719,8 +824,15 @@ impl Dispatch<XdgSurface, ()> for ServerState {
                 if let Some(x) = state.xdg_surfaces.get_mut(&xdg_id) {
                     x.role = XdgRole::Popup;
                 }
-                // Popups are not shown in this feature: dismiss it at once (research R9).
-                popup.popup_done();
+                popup::create(
+                    state,
+                    xdg_id.clone(),
+                    popup,
+                    wm_base,
+                    surface,
+                    parent,
+                    rules,
+                );
             }
             xdg_surface::Request::SetWindowGeometry {
                 x,
@@ -748,6 +860,7 @@ impl Dispatch<XdgSurface, ()> for ServerState {
                         x.serials.drain(..=i);
                         x.acked = true;
                         acked(state, &xdg_id, serial);
+                        popup::acked(state, &xdg_id, serial);
                     }
                     None => resource.post_error(
                         xdg_surface::Error::InvalidSerial,
@@ -756,13 +869,15 @@ impl Dispatch<XdgSurface, ()> for ServerState {
                 }
             }
             xdg_surface::Request::Destroy => {
-                if let Some(x) = state.xdg_surfaces.get(&xdg_id)
-                    && let XdgRole::Toplevel(t) = &x.role
-                    && t.is_alive()
-                {
+                let defunct = match state.xdg_surfaces.get(&xdg_id).map(|x| &x.role) {
+                    Some(XdgRole::Toplevel(t)) => t.is_alive(),
+                    Some(XdgRole::Popup) => popup::has_role_object(state, &xdg_id),
+                    _ => false,
+                };
+                if defunct {
                     resource.post_error(
                         xdg_surface::Error::DefunctRoleObject,
-                        "xdg_surface destroyed before its toplevel",
+                        "xdg_surface destroyed before its role object",
                     );
                 }
             }
@@ -773,6 +888,7 @@ impl Dispatch<XdgSurface, ()> for ServerState {
     fn destroyed(state: &mut Self, _: ClientId, resource: &XdgSurface, _: &()) {
         let id = resource.id();
         unmap(state, &id);
+        popup::forget(state, &id);
         state.xdg_surfaces.remove(&id);
     }
 }
@@ -872,18 +988,5 @@ impl Dispatch<XdgToplevel, ObjectId> for ServerState {
         if let Some(x) = state.xdg_surfaces.get_mut(xdg_id) {
             x.role = XdgRole::None;
         }
-    }
-}
-
-impl Dispatch<XdgPopup, ()> for ServerState {
-    fn request(
-        _: &mut Self,
-        _: &Client,
-        _: &XdgPopup,
-        _: xdg_popup::Request,
-        _: &(),
-        _: &DisplayHandle,
-        _: &mut DataInit<'_, Self>,
-    ) {
     }
 }
