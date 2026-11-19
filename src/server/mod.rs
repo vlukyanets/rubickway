@@ -8,13 +8,16 @@
 mod commit_queue;
 mod compositor;
 mod cursor_shape;
+mod data_control;
 mod data_device;
 mod descriptors;
 mod dmabuf;
 mod output;
 mod popup;
+mod primary_selection;
 mod release;
 mod seat;
+mod selection;
 mod shm;
 mod subcompositor;
 mod syncobj;
@@ -106,7 +109,7 @@ pub struct ShmImage<'a> {
 /// ` (pid 1234, kitty)` for the connect log line: the peer's pid from the socket and its
 /// command name from `/proc/<pid>/comm` (an in-memory procfs file, read at once). For the log
 /// only: both can be spoofed.
-fn describe_process(client: &wayland_server::Client, dh: &DisplayHandle) -> String {
+pub(crate) fn describe_process(client: &wayland_server::Client, dh: &DisplayHandle) -> String {
     let Ok(creds) = client.get_credentials(dh) else {
         return String::new();
     };
@@ -190,6 +193,10 @@ pub struct ServerState {
     pub(crate) popups: HashMap<ObjectId, popup::PopupData>,
     pub(crate) outputs: Vec<output::OutputEntry>,
     pub(crate) seat: seat::SeatState,
+    /// The clipboard and the primary selection (clipboard data-model "SelectionState").
+    pub(crate) selection: selection::SelectionState,
+    /// The primary selection's global, while it is offered (clipboard research C10).
+    primary_selection_global: Option<wayland_server::backend::GlobalId>,
     /// Mapped windows and their root surface.
     pub(crate) windows: HashMap<WindowId, ObjectId>,
     /// The displays each window was last told it is on (`wl_surface.enter`).
@@ -264,6 +271,9 @@ impl Server {
         seat::create_global(&dh);
         cursor_shape::create_global(&dh);
         data_device::create_global(&dh);
+        let primary_selection_global = primary_selection::create_global(&dh);
+        data_control::ext::create_global(&dh);
+        data_control::wlr::create_global(&dh);
         viewporter::create_globals(&dh);
         Ok(Server {
             display,
@@ -294,6 +304,8 @@ impl Server {
                 popups: HashMap::new(),
                 outputs: Vec::new(),
                 seat: seat::SeatState::default(),
+                selection: selection::SelectionState::default(),
+                primary_selection_global: Some(primary_selection_global),
                 windows: HashMap::new(),
                 window_outputs: HashMap::new(),
                 window_events: Vec::new(),
@@ -337,7 +349,10 @@ impl Server {
 
     /// Reads and handles the requests of all applications.
     pub fn dispatch(&mut self) -> io::Result<()> {
-        self.display.dispatch_clients(&mut self.state).map(|_| ())
+        let result = self.display.dispatch_clients(&mut self.state).map(|_| ());
+        // Clipboard changes of the whole batch are told once (clipboard research C3).
+        selection::announce(&mut self.state);
+        result
     }
 
     /// Sends queued events to all applications without blocking; an application whose buffer
@@ -411,6 +426,15 @@ impl Server {
     /// images, and when the GPU has timelines.
     pub fn set_timelines(&mut self, timelines: Rc<dyn Timelines>) {
         syncobj::set_timelines(&mut self.state, timelines);
+    }
+
+    /// Offers the primary selection (middle-click paste) or not (clipboard research C10). Call
+    /// before applications connect; it is on unless switched off.
+    pub fn set_primary_selection(&mut self, enabled: bool) {
+        self.state.selection.primary_enabled = enabled;
+        if !enabled && let Some(global) = self.state.primary_selection_global.take() {
+            self.state.dh.remove_global::<ServerState>(global);
+        }
     }
 
     /// How client files are recognised as GPU images.
@@ -533,6 +557,7 @@ impl Server {
     /// compositor clock.
     pub fn deliver(&mut self, inputs: &[ClientInput], time_ms: u32) {
         seat::deliver(&mut self.state, inputs, time_ms);
+        selection::announce(&mut self.state);
     }
 
     /// The configured keymap (xkb text), shared with every application's keyboard.

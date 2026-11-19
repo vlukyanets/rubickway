@@ -25,6 +25,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 udev = "0.9"
 wayland-backend = "0.3"
 wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
+# The older clipboard-tool protocol (zwlr_data_control_manager_v1), which wayland-protocols does
+# not have; generated bindings from the same project (clipboard research C1).
+wayland-protocols-wlr = { version = "0.3", features = ["server"] }
 # `libwayland_1_23` only unlocks the per-client buffer limit API (research R8); with the
 # pure-Rust backend it links no system library.
 wayland-server = { version = "0.31", features = ["libwayland_1_23"] }
@@ -35,6 +38,7 @@ proptest = "1"
 # Test clients for the protocol tests (pure-Rust backend, no libwayland).
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "server", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client", "server"] }
 
 [lints.rust]
 # Principle V: unsafe only in FFI, backend, render and plugin loader modules, which opt in with

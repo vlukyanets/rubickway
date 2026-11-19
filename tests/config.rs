@@ -616,3 +616,53 @@ fn a_pointer_combination_bound_twice_keeps_the_first() {
         Some(PointerAction::ResizeWindow)
     );
 }
+
+// --- clipboard: primary-selection (clipboard tasks T005, contracts/config.md) ----------------
+
+#[test]
+fn the_primary_selection_is_on_unless_switched_off() {
+    let (config, warnings) = parse("");
+    assert!(config.primary_selection);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // `on` and `off` (bare words are strings in KDL 2.0), and KDL's own #true and #false.
+    for (text, on) in [
+        ("primary-selection on", true),
+        ("primary-selection off", false),
+        ("primary-selection \"off\"", false),
+        ("primary-selection OFF", false),
+        ("primary-selection #true", true),
+        ("primary-selection #false", false),
+    ] {
+        let (config, warnings) = parse(text);
+        assert_eq!(config.primary_selection, on, "{text}");
+        assert!(warnings.is_empty(), "{text}: {warnings:?}");
+    }
+}
+
+#[test]
+fn a_bad_primary_selection_value_warns_and_keeps_it_on() {
+    for bad in [
+        "primary-selection",
+        "primary-selection no",
+        "primary-selection 0",
+        "primary-selection off on",
+        "primary-selection off { x; }",
+    ] {
+        let (config, warnings) = parse(&format!("// clipboard\n{bad}"));
+        assert!(config.primary_selection, "{bad}");
+        assert_eq!(lines(&warnings), vec![Some(2)], "{bad}: {warnings:?}");
+        assert!(
+            warnings[0]
+                .message
+                .contains("`primary-selection` expects on or off"),
+            "{bad}: {warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn primary_selection_given_twice_keeps_the_last_with_a_warning() {
+    let (config, warnings) = parse("primary-selection off\nprimary-selection on");
+    assert!(config.primary_selection);
+    assert_eq!(lines(&warnings), vec![Some(2)], "{warnings:?}");
+}

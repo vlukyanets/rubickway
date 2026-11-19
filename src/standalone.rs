@@ -155,6 +155,7 @@ pub fn run() -> Result<(), AppError> {
     let renderer = GlesRenderer::new(backend.egl().load_gl()).map_err(|e| backend.unusable(e))?;
     heartbeat.beat();
     let mut server = Server::new()?;
+    server.set_primary_selection(config.primary_selection);
     offer_gpu_images(&backend, &renderer, &mut server);
     server.set_max_texture_side(renderer.max_texture_side());
     let (listener, name) = Server::listen()?;

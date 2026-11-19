@@ -32,6 +32,8 @@ pub struct Config {
     pub distant_windows: DistantWindows,
     /// The cursor theme for pointer images (cursor-shapes FR-010); `None`: the `default` theme.
     pub cursor_theme: Option<String>,
+    /// Middle-click paste, the primary selection (clipboard FR-006); on by default.
+    pub primary_selection: bool,
 }
 
 impl Default for Config {
@@ -43,6 +45,7 @@ impl Default for Config {
             watchdog_timeout: Duration::from_secs(10),
             distant_windows: DistantWindows::default(),
             cursor_theme: None,
+            primary_selection: true,
         }
     }
 }
@@ -455,6 +458,7 @@ impl Parser<'_> {
                 "watchdog-timeout-sec" => self.watchdog(node),
                 "distant-windows" => self.distant_windows(node),
                 "cursor" => self.cursor(node),
+                "primary-selection" => self.primary_selection(node),
                 other => self.warn(node, format!("unknown setting `{other}`, ignored")),
             }
         }
@@ -726,6 +730,28 @@ impl Parser<'_> {
                 node,
                 "`watchdog-timeout-sec` expects whole seconds from 1 to 600",
             ),
+        }
+    }
+
+    /// `primary-selection on|off` (clipboard contracts/config.md): the words, which are plain
+    /// strings in KDL 2.0, or KDL's own `#true` and `#false`.
+    fn primary_selection(&mut self, node: &KdlNode) {
+        let value = match (node.entries(), node.children()) {
+            ([entry], None) if entry.name().is_none() => {
+                let value = entry.value();
+                value.as_bool().or_else(|| {
+                    match value.as_string().map(str::to_ascii_lowercase).as_deref() {
+                        Some("on") => Some(true),
+                        Some("off") => Some(false),
+                        _ => None,
+                    }
+                })
+            }
+            _ => None,
+        };
+        match value {
+            Some(on) => self.config.primary_selection = on,
+            None => self.warn(node, "`primary-selection` expects on or off"),
         }
     }
 

@@ -14,10 +14,14 @@ use rubickway::server::Server;
 use wayland_client::backend::protocol::ProtocolError;
 use wayland_client::backend::{ObjectData, ObjectId};
 use wayland_client::protocol::wl_buffer::WlBuffer;
+use wayland_client::protocol::wl_data_offer::WlDataOffer;
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_offer_v1::ExtDataControlOfferV1;
+use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
+use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_offer_v1::ZwlrDataControlOfferV1;
 
 /// One received event.
 pub struct Recorded {
@@ -63,9 +67,16 @@ where
         });
     }
 
-    /// The one event that creates an object here: `zwp_linux_buffer_params_v1.created`.
+    /// The events that create an object here: `zwp_linux_buffer_params_v1.created` and the
+    /// `data_offer` events of the clipboard devices (clipboard tests).
     fn event_created_child(_: u16, qh: &QueueHandle<Self>) -> Arc<dyn ObjectData> {
-        qh.make_data::<WlBuffer, ()>(())
+        match I::interface().name {
+            "wl_data_device" => qh.make_data::<WlDataOffer, ()>(()),
+            "zwp_primary_selection_device_v1" => qh.make_data::<ZwpPrimarySelectionOfferV1, ()>(()),
+            "ext_data_control_device_v1" => qh.make_data::<ExtDataControlOfferV1, ()>(()),
+            "zwlr_data_control_device_v1" => qh.make_data::<ZwlrDataControlOfferV1, ()>(()),
+            _ => qh.make_data::<WlBuffer, ()>(()),
+        }
     }
 }
 
