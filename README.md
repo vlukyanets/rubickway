@@ -22,8 +22,6 @@ driving the displays, or into shared memory.
   `libglvnd`, `libxkbcommon`, `xkeyboard-config`. On Debian/Ubuntu: `libinput-dev`,
   `libseat-dev`, `libgbm-dev`, `libudev-dev`, `libxkbcommon-dev`, `libegl-dev`,
   `libgles-dev`, `libegl-mesa0`, `xkb-data`.
-- [kitty](https://sw.kovidgoyal.net/kitty/), the terminal Mod+Return starts, and a scalable
-  monospace font for it, such as `ttf-dejavu` (kitty does not start with bitmap fonts only).
 
 ## Setup, run, test
 
@@ -99,8 +97,8 @@ binds {
 
     // Pointer bindings: modifiers plus MouseLeft, MouseRight or MouseMiddle, and one of
     // move-window, resize-window, pan-canvas. With none configured, these are the defaults.
-    Mod+MouseLeft        { move-window; }
-    Mod+Shift+MouseLeft  { pan-canvas; }
+    Mod+MouseLeft        { pan-canvas; }
+    Mod+Shift+MouseLeft  { move-window; }
     Mod+MouseRight       { resize-window; }
     Mod+Shift+MouseRight { resize-window; }
 }
@@ -113,8 +111,9 @@ Spawn and pointer defaults are replaced separately: binding only pointer gesture
 Mod+Return, and binding only programs keeps the gestures. A pointer binding needs at least one
 modifier. The keyboard is US English for now; other layouts come later.
 
-For example, three programs on their own keys, and the canvas panned with Mod + left drag,
-windows moved with Mod+Shift + left drag and resized with Mod + middle drag:
+For example, three programs on their own keys, and windows moved with Mod + left drag as in
+GNOME or KDE, the canvas panned with Mod+Shift + left drag and windows resized with Mod + middle
+drag:
 
 ```kdl
 binds {
@@ -122,8 +121,8 @@ binds {
     Mod+B      { spawn "firefox"; }
     Mod+E      { spawn "kitty" "-e" "yazi"; }
 
-    Mod+MouseLeft       { pan-canvas; }
-    Mod+Shift+MouseLeft { move-window; }
+    Mod+MouseLeft       { move-window; }
+    Mod+Shift+MouseLeft { pan-canvas; }
     Mod+MouseMiddle     { resize-window; }
 }
 ```
@@ -167,8 +166,8 @@ focus.
 
 | Input | Effect |
 | --- | --- |
-| Mod + left-drag on a window, or drag its title bar | focus and move the window, also to another monitor |
-| Mod + Shift + left-drag (anywhere), Mod + left-drag or left-drag on the background | pan the canvas (no focus change) |
+| Mod + left-drag (anywhere, also over a window), or left-drag on the background | pan the canvas (no focus change) |
+| Mod + Shift + left-drag on a window, or drag its title bar | focus and move the window, also to another monitor |
 | Mod + scroll, pinch, wheel over the background | zoom around the pointer |
 | touchpad scroll over the background | pan the canvas |
 | Mod + right-drag on a window, or drag its border | resize it from the nearest edge or corner |

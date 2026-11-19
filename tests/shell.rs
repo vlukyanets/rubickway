@@ -526,11 +526,11 @@ fn only_leaves(out: &[ClientInput]) -> bool {
 }
 
 #[test]
-fn mod_shift_drag_over_a_window_pans_without_input_focus_or_raise() {
+fn mod_drag_over_a_window_pans_without_input_focus_or_raise() {
     let mut s = shell_with_window();
     s.apply(mapped(2, 50.0, 50.0)); // focused and on top, at the centre
     motion(&mut s, 410.0, 360.0); // over window 1 only
-    mods(&mut s, super_shift(), 65);
+    mods(&mut s, super_mod(), 64);
     let anchor = s
         .viewer()
         .camera()
@@ -700,10 +700,10 @@ fn shell_with_two_windows() -> Shell {
     s
 }
 
-/// Starts a Mod + left move (the default `move-window` binding) at screen (x, y).
+/// Starts a Mod+Shift + left move (the default `move-window` binding) at screen (x, y).
 fn start_move(s: &mut Shell, x: f64, y: f64) -> Vec<ClientInput> {
     motion(s, x, y);
-    mods(s, super_mod(), 64);
+    mods(s, super_shift(), 65);
     left(s, true)
 }
 
@@ -1255,9 +1255,9 @@ fn a_maximized_window_stays_while_the_view_moves_and_others_can_be_raised() {
     answer(&mut s, 1, Size::new(1000.0, 800.0), true);
     assert_eq!(stack(&s).last(), Some(&w(1)), "raised");
     s.take_commands();
-    // Pan with Mod+Shift + left drag, then zoom.
+    // Pan with Mod + left drag, then zoom.
     motion(&mut s, 100.0, 100.0);
-    mods(&mut s, super_shift(), 65);
+    mods(&mut s, super_mod(), 64);
     left(&mut s, true);
     motion(&mut s, 300.0, 200.0);
     left(&mut s, false);
@@ -1424,18 +1424,18 @@ fn navigation_leaves_fullscreen_and_is_consumed() {
     type Gesture = Box<dyn Fn(&mut Shell) -> Vec<ClientInput>>;
     let cases: Vec<(&str, Gesture)> = vec![
         (
-            "Mod + Shift + left (pan) on the window",
+            "Mod + left (pan) on the window",
             Box::new(|s: &mut Shell| {
                 motion(s, 500.0, 400.0);
-                mods(s, super_shift(), 65);
+                mods(s, super_mod(), 64);
                 left(s, true)
             }),
         ),
         (
-            "Mod + left (move) on the background",
+            "Mod+Shift + left (move) on the background",
             Box::new(|s: &mut Shell| {
                 motion(s, 10.0, 10.0);
-                mods(s, super_mod(), 64);
+                mods(s, super_shift(), 65);
                 left(s, true)
             }),
         ),
@@ -2456,8 +2456,8 @@ fn the_pointer_is_hidden_only_over_a_window_that_hid_it_and_without_a_gesture() 
     motion(&mut s, 500.0, 400.0);
     s.apply(app_cursor(1, AppCursor::Hidden));
     assert_eq!(s.cursor(), CursorShape::Hidden);
-    // A compositor gesture shows its own shape: Mod+Shift + left drag pans everywhere.
-    mods(&mut s, super_shift(), 65);
+    // A compositor gesture shows its own shape: Mod + left drag pans everywhere.
+    mods(&mut s, super_mod(), 64);
     left(&mut s, true);
     assert_eq!(s.cursor(), CursorShape::Grabbing);
     let out = left(&mut s, false);
@@ -2520,7 +2520,7 @@ fn gestures_show_their_own_images_over_a_named_window_and_enter_it_again_after()
     let mut s = shell_with_window();
     motion(&mut s, 410.0, 360.0);
     s.apply(named(1, CursorName::Text));
-    // Move (Mod + left).
+    // Move (Mod+Shift + left).
     let out = start_move(&mut s, 410.0, 360.0);
     assert!(
         out.contains(&ClientInput::PointerLeave { window: w(1) }),
@@ -2714,7 +2714,7 @@ fn a_window_carried_across_jumps_to_the_region_the_new_viewer_shows() {
     to_a(&mut s);
     // Centred in A at (-500, 0): origin (-600, -50); the pointer grabs window point (100, 50).
     s.apply(mapped(1, 200.0, 100.0));
-    mods(&mut s, super_mod(), 64);
+    mods(&mut s, super_shift(), 65);
     left(&mut s, true);
     assert_eq!(s.cursor(), CursorShape::Move);
     moved(&mut s, 1000.0, 0.0);
@@ -2941,7 +2941,7 @@ fn removing_the_viewer_under_the_pointer_ends_a_move_where_the_window_is() {
     let mut s = two_viewers();
     to_b(&mut s);
     s.apply(mapped(1, 200.0, 100.0));
-    mods(&mut s, super_mod(), 64);
+    mods(&mut s, super_shift(), 65);
     left(&mut s, true);
     moved(&mut s, 50.0, 0.0);
     assert_eq!(origin(&s, 1), Point::new(450.0, -50.0));
@@ -3761,7 +3761,7 @@ fn canvas_actions_close_every_popup_first() {
             Box::new(|_, _| {}),
         ),
         (
-            "move (Mod + left)",
+            "move (Mod+Shift + left)",
             Box::new(|s| start_move(s, 800.0, 400.0)),
             Box::new(|s, _| assert_eq!(s.cursor(), CursorShape::Move)),
         ),
