@@ -5,8 +5,8 @@
 //! application applies here; the shell never calls the server (client-windows research R7) and
 //! answers with [`WindowCommand`]s instead (window-management research W1). Input is routed per
 //! contracts/input.md: Mod + scroll, pinch and the background go to the viewer (canvas
-//! navigation), the pointer bindings pan, move and resize (by default Mod + left moves and
-//! Mod + right resizes a window, Mod+Shift + left pans), Mod+Tab cycles focus, everything else
+//! navigation), the pointer bindings pan, move and resize (by default Mod + left pans,
+//! Mod+Shift + left moves and Mod + right resizes a window), Mod+Tab cycles focus, everything else
 //! goes to the window under the pointer or with keyboard focus, as [`ClientInput`]s. Maximize and fullscreen are decided here too (research W7, W8).
 
 mod cursor;

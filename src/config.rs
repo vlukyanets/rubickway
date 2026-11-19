@@ -114,8 +114,8 @@ fn default_pointer() -> Vec<PointerConfig> {
         action,
     };
     vec![
-        b(m, Button::Left, PointerAction::MoveWindow),
-        b(ms, Button::Left, PointerAction::PanCanvas),
+        b(m, Button::Left, PointerAction::PanCanvas),
+        b(ms, Button::Left, PointerAction::MoveWindow),
         b(m, Button::Right, PointerAction::ResizeWindow),
         b(ms, Button::Right, PointerAction::ResizeWindow),
     ]

@@ -194,8 +194,9 @@ impl Bindings {
     }
 }
 
-/// The default gestures for a given Mod (FR-032, owner 2026-11-03): Mod + left moves, Mod+Shift +
-/// left pans, Mod + right resizes, with or without Shift.
+/// The default gestures for a given Mod (FR-032; owner 2026-11-19): Mod + left pans anywhere, so
+/// a pan that starts over a window never grabs it; Mod+Shift + left moves a window; Mod + right
+/// resizes, with or without Shift.
 fn default_pointer_table(mod_key: ModKey) -> Vec<PointerBind> {
     let m = mod_key.modifiers();
     let ms = Modifiers { shift: true, ..m };
@@ -204,8 +205,8 @@ fn default_pointer_table(mod_key: ModKey) -> Vec<PointerBind> {
         action,
     };
     vec![
-        b(m, Button::Left, PointerAction::MoveWindow),
-        b(ms, Button::Left, PointerAction::PanCanvas),
+        b(m, Button::Left, PointerAction::PanCanvas),
+        b(ms, Button::Left, PointerAction::MoveWindow),
         b(m, Button::Right, PointerAction::ResizeWindow),
         b(ms, Button::Right, PointerAction::ResizeWindow),
     ]
@@ -300,11 +301,11 @@ mod tests {
             let ms = with(m, true);
             assert_eq!(
                 b.pointer_lookup(m, Button::Left),
-                Some(PointerAction::MoveWindow)
+                Some(PointerAction::PanCanvas)
             );
             assert_eq!(
                 b.pointer_lookup(ms, Button::Left),
-                Some(PointerAction::PanCanvas)
+                Some(PointerAction::MoveWindow)
             );
             assert_eq!(
                 b.pointer_lookup(m, Button::Right),

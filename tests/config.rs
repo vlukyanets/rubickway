@@ -507,11 +507,11 @@ fn without_pointer_bindings_the_defaults_apply() {
     let b = config.bindings();
     assert_eq!(
         b.pointer_lookup(SUPER, Button::Left),
-        Some(PointerAction::MoveWindow)
+        Some(PointerAction::PanCanvas)
     );
     assert_eq!(
         b.pointer_lookup(SUPER_SHIFT, Button::Left),
-        Some(PointerAction::PanCanvas)
+        Some(PointerAction::MoveWindow)
     );
     assert_eq!(
         b.pointer_lookup(SUPER, Button::Right),
@@ -526,8 +526,15 @@ fn without_pointer_bindings_the_defaults_apply() {
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(
         config.bindings().pointer_lookup(SUPER, Button::Left),
-        Some(PointerAction::MoveWindow)
+        Some(PointerAction::PanCanvas)
     );
+}
+
+#[test]
+fn the_config_defaults_and_the_built_in_defaults_agree() {
+    let (config, _) = parse("");
+    let built_in = rubickway::input::bindings::Bindings::default();
+    assert_eq!(config.bindings().pointer(), built_in.pointer());
 }
 
 #[test]
@@ -535,8 +542,8 @@ fn pointer_bindings_replace_the_pointer_defaults_and_keep_the_spawn_default() {
     // The opposite of the defaults for the left button, and a middle-button resize.
     let (config, warnings) = parse(
         "binds {\n\
-         Mod+MouseLeft { pan-canvas; }\n\
-         Mod+Shift+mouseleft { move-window; }\n\
+         Mod+MouseLeft { move-window; }\n\
+         Mod+Shift+mouseleft { pan-canvas; }\n\
          Mod+MouseMiddle { resize-window; }\n\
          }",
     );
@@ -544,11 +551,11 @@ fn pointer_bindings_replace_the_pointer_defaults_and_keep_the_spawn_default() {
     let b = config.bindings();
     assert_eq!(
         b.pointer_lookup(SUPER, Button::Left),
-        Some(PointerAction::PanCanvas)
+        Some(PointerAction::MoveWindow)
     );
     assert_eq!(
         b.pointer_lookup(SUPER_SHIFT, Button::Left),
-        Some(PointerAction::MoveWindow)
+        Some(PointerAction::PanCanvas)
     );
     assert_eq!(
         b.pointer_lookup(SUPER, Button::Middle),
@@ -589,7 +596,7 @@ fn bad_pointer_bindings_are_rejected_one_warning_each() {
         assert_eq!(lines(&warnings), vec![Some(2)], "{bad}: {warnings:?}");
         assert_eq!(
             config.bindings().pointer_lookup(SUPER, Button::Left),
-            Some(PointerAction::MoveWindow),
+            Some(PointerAction::PanCanvas),
             "{bad}: the defaults stay"
         );
     }
