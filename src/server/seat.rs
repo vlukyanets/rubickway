@@ -17,7 +17,7 @@ use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, 
 
 use super::compositor::{self, Role};
 use super::dmabuf::client_number;
-use super::{ServerState, popup, xdg_shell};
+use super::{ServerState, popup, selection, xdg_shell};
 use crate::canvas::Point;
 use crate::ffi::shm_map::sealed_memfd;
 use crate::input::{RawModifiers, ScrollSource};
@@ -58,6 +58,32 @@ pub(crate) struct SeatState {
     /// Per application, the serial of its latest button press and of its latest key press or
     /// release: a popup grab must carry one of them (popups research P9).
     popup_serials: HashMap<ClientId, (Option<u32>, Option<u32>)>,
+    /// Per application, the serials of its latest key, button and keyboard-enter events: setting
+    /// the clipboard must carry one of them (clipboard research C4).
+    input_serials: HashMap<ClientId, SerialRing>,
+}
+
+/// The latest few serials of one application's input events (clipboard research C4).
+#[derive(Debug, Default)]
+pub(crate) struct SerialRing {
+    serials: std::collections::VecDeque<u32>,
+}
+
+impl SerialRing {
+    /// How many serials are kept: a key press, its release and the modifiers around them, with
+    /// room to spare, while a stale one soon drops out.
+    const LEN: usize = 16;
+
+    fn push(&mut self, serial: u32) {
+        if self.serials.len() == Self::LEN {
+            self.serials.pop_front();
+        }
+        self.serials.push_back(serial);
+    }
+
+    fn contains(&self, serial: u32) -> bool {
+        self.serials.contains(&serial)
+    }
 }
 
 /// The cursor at each enter, until the client asks for something (cursor-shapes FR-003).
@@ -81,8 +107,65 @@ impl Default for SeatState {
             enter_serial: None,
             focus_cursor: ENTER_CURSOR,
             popup_serials: HashMap::new(),
+            input_serials: HashMap::new(),
         }
     }
+}
+
+/// Whether `serial` is one of `client`'s latest key, button or keyboard-enter serials: a
+/// clipboard or primary selection may be set with it (clipboard research C4, FR-004).
+pub(crate) fn selection_serial_ok(state: &ServerState, client: &ClientId, serial: u32) -> bool {
+    state
+        .seat
+        .input_serials
+        .get(client)
+        .is_some_and(|ring| ring.contains(serial))
+}
+
+/// The application that has the keyboard: of a window's root surface or, during a popup grab, of
+/// the popup's surface (clipboard research C3).
+pub(crate) fn keyboard_client(state: &ServerState) -> Option<ClientId> {
+    state
+        .seat
+        .keyboard_surface
+        .as_ref()
+        .and_then(|s| s.client())
+        .map(|c| c.id())
+}
+
+/// Remembers the serial of an input event `surface`'s application got (clipboard research C4).
+fn note_input_serial(state: &mut ServerState, surface: &WlSurface, serial: u32) {
+    let Some(client) = surface.client().map(|c| c.id()) else {
+        return;
+    };
+    forget_gone_clients(state);
+    state
+        .seat
+        .input_serials
+        .entry(client)
+        .or_default()
+        .push(serial);
+}
+
+/// Applications that are gone have no live input objects left: forget their serials.
+fn forget_gone_clients(state: &mut ServerState) {
+    let SeatState {
+        pointers,
+        keyboards,
+        popup_serials,
+        input_serials,
+        ..
+    } = &mut state.seat;
+    let live = |c: &ClientId| {
+        pointers
+            .iter()
+            .any(|p| p.is_alive() && p.client().is_some_and(|x| x.id() == *c))
+            || keyboards
+                .iter()
+                .any(|k| k.is_alive() && k.client().is_some_and(|x| x.id() == *c))
+    };
+    popup_serials.retain(|c, _| live(c));
+    input_serials.retain(|c, _| live(c));
 }
 
 /// Whether `serial` is `client`'s latest button press or latest key press or release (popups
@@ -96,26 +179,13 @@ pub(crate) fn grab_serial_ok(state: &ServerState, client: &ClientId, serial: u32
 }
 
 /// Remembers a serial that may start a popup grab: a button press (`button`) or a key event.
+/// It also counts for the clipboard (`note_input_serial`).
 fn note_user_serial(state: &mut ServerState, surface: &WlSurface, serial: u32, button: bool) {
     let Some(client) = surface.client().map(|c| c.id()) else {
         return;
     };
-    let SeatState {
-        pointers,
-        keyboards,
-        popup_serials,
-        ..
-    } = &mut state.seat;
-    // Applications that are gone have no live input objects left: forget them.
-    popup_serials.retain(|c, _| {
-        pointers
-            .iter()
-            .any(|p| p.is_alive() && p.client().is_some_and(|x| x.id() == *c))
-            || keyboards
-                .iter()
-                .any(|k| k.is_alive() && k.client().is_some_and(|x| x.id() == *c))
-    });
-    let entry = popup_serials.entry(client).or_default();
+    note_input_serial(state, surface, serial);
+    let entry = state.seat.popup_serials.entry(client).or_default();
     if button {
         entry.0 = Some(serial);
     } else {
@@ -303,9 +373,13 @@ pub(crate) fn deliver(state: &mut ServerState, inputs: &[ClientInput], time_ms: 
                 if *pressed {
                     state.seat.last_press = Some((*window, serial));
                     note_user_serial(state, &surface, serial, true);
-                } else if state.seat.buttons_down.is_empty() {
-                    // Only a press still held counts for move and resize (FR-016).
-                    state.seat.last_press = None;
+                } else {
+                    // A release counts for the clipboard (text selected with the mouse).
+                    note_input_serial(state, &surface, serial);
+                    if state.seat.buttons_down.is_empty() {
+                        // Only a press still held counts for move and resize (FR-016).
+                        state.seat.last_press = None;
+                    }
                 }
                 let button_state = if *pressed {
                     wl_pointer::ButtonState::Pressed
@@ -429,6 +503,7 @@ fn keyboard_focus(state: &mut ServerState, window: Option<WindowId>) {
     }
     let Some(window) = window else {
         state.seat.pressed_keys.clear();
+        selection::focus_changed(state, None);
         return;
     };
     let Some(root) = state.windows.get(&window).cloned() else {
@@ -437,7 +512,11 @@ fn keyboard_focus(state: &mut ServerState, window: Option<WindowId>) {
     let Some(surface) = state.surfaces.get(&root).map(|s| s.resource.clone()) else {
         return;
     };
+    // The clipboard comes before the keyboard enter, as the protocol asks (clipboard
+    // research C3).
+    selection::focus_changed(state, surface.client().map(|c| c.id()));
     let serial = state.next_serial();
+    note_input_serial(state, &surface, serial);
     let keys = pressed_keys_array(state);
     for k in keyboards_for(state, &surface) {
         k.enter(serial, &surface, keys.clone());
@@ -472,6 +551,7 @@ fn popup_keyboard(state: &mut ServerState, window: WindowId, popup: Option<Popup
         }
     }
     let serial = state.next_serial();
+    note_input_serial(state, &surface, serial);
     let keys = pressed_keys_array(state);
     for k in keyboards_for(state, &surface) {
         k.enter(serial, &surface, keys.clone());
@@ -672,5 +752,24 @@ impl Dispatch<WlTouch, ()> for ServerState {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ring_keeps_the_16_latest_serials() {
+        let mut ring = SerialRing::default();
+        assert!(!ring.contains(1), "an empty ring holds nothing");
+        for serial in 1..=20 {
+            ring.push(serial);
+        }
+        // 20 is the newest; 5 was pushed 16 events ago, 4 seventeen.
+        assert!(ring.contains(20));
+        assert!(ring.contains(5));
+        assert!(!ring.contains(4));
+        assert!(!ring.contains(1));
     }
 }

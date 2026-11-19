@@ -13,6 +13,7 @@ use wayland_client::protocol::wl_keyboard;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_surface;
+use wayland_client::protocol::{wl_data_device_manager, wl_data_offer};
 use wayland_client::{Connection, Proxy};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{
     self, Flags, ZwpLinuxBufferParamsV1,
@@ -24,6 +25,10 @@ use wayland_protocols::xdg::shell::client::xdg_toplevel;
 use rubickway::shell::CursorName;
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
 
+use crate::clipboard::{
+    answer_sends, clip_client, copy_now, focus, last_primary, last_selection, prim_client,
+    read_all, release_serial, select,
+};
 use crate::commits::unfinished;
 use crate::cursor_shape::{set_raw_shape, shape, shape_client};
 use crate::dmabuf::{ARGB, dmabuf, gpu_harness, immed, imports_succeed};
@@ -1113,4 +1118,141 @@ fn a_popup_acking_a_serial_never_sent_is_an_error() {
         shm_error(&mut h, pc.index),
         Some(xdg_surface::Error::InvalidSerial as u32)
     );
+}
+
+// --- clipboard (clipboard contracts/protocols.md "Misbehaving clients", tasks T024) ----------
+
+#[test]
+fn a_source_offering_10_000_types_keeps_256_and_others_keep_working() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let a = clip_client(&mut h);
+    let b = clip_client(&mut h);
+    focus(&mut h, &a);
+    let names: Vec<String> = (0..10_000).map(|i| format!("type/{}", i % 5_000)).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    copy_now(&mut h, &a, &refs);
+    focus(&mut h, &b);
+    let types = last_selection(h.c(b.pc.index), &b.device)
+        .flatten()
+        .unwrap()
+        .1;
+    assert_eq!(types.len(), 256);
+    assert!(!h.c(a.pc.index).is_disconnected());
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn an_owner_that_never_writes_or_a_reader_that_never_reads_stalls_no_one_else() {
+    for owner_writes in [false, true] {
+        let mut h = Harness::new();
+        let good = good_client(&mut h);
+        let a = clip_client(&mut h);
+        let b = clip_client(&mut h);
+        let c = clip_client(&mut h);
+        focus(&mut h, &a);
+        copy_now(&mut h, &a, &["text/plain"]);
+        focus(&mut h, &b);
+        let (offer, _) = last_selection(h.c(b.pc.index), &b.device)
+            .flatten()
+            .unwrap();
+        // B pastes; A either never writes, or writes while B never reads.
+        let (reader, writer) = std::io::pipe().unwrap();
+        offer.receive("text/plain".into(), writer.as_fd());
+        drop(writer);
+        h.roundtrip();
+        if owner_writes {
+            answer_sends(&mut h, a.pc.index, b"never read");
+        }
+        // Everyone else carries on: C copies, B pastes from C.
+        focus(&mut h, &c);
+        copy_now(&mut h, &c, &["text/plain"]);
+        focus(&mut h, &b);
+        let (offer, _) = last_selection(h.c(b.pc.index), &b.device)
+            .flatten()
+            .unwrap();
+        let (reader2, writer2) = std::io::pipe().unwrap();
+        offer.receive("text/plain".into(), writer2.as_fd());
+        drop(writer2);
+        h.roundtrip();
+        answer_sends(&mut h, c.pc.index, b"from c");
+        h.roundtrip();
+        assert_eq!(
+            read_all(reader2).as_deref(),
+            Some(&b"from c"[..]),
+            "owner writes: {owner_writes}"
+        );
+        assert_good_client_works(&mut h, &good);
+        drop(reader);
+    }
+}
+
+#[test]
+fn drag_requests_on_a_clipboard_offer_are_errors_to_that_client_only() {
+    for finish in [true, false] {
+        let mut h = Harness::new();
+        let good = good_client(&mut h);
+        let a = clip_client(&mut h);
+        let b = clip_client(&mut h);
+        focus(&mut h, &a);
+        copy_now(&mut h, &a, &["text/plain"]);
+        focus(&mut h, &b);
+        let (offer, _) = last_selection(h.c(b.pc.index), &b.device)
+            .flatten()
+            .unwrap();
+        if finish {
+            offer.finish();
+        } else {
+            offer.set_actions(
+                wl_data_device_manager::DndAction::Copy,
+                wl_data_device_manager::DndAction::Copy,
+            );
+        }
+        h.roundtrip();
+        let expected = if finish {
+            wl_data_offer::Error::InvalidFinish as u32
+        } else {
+            wl_data_offer::Error::InvalidOffer as u32
+        };
+        let error = h
+            .c(b.pc.index)
+            .error()
+            .map(|e| (e.object_interface.clone(), e.code));
+        assert_eq!(error, Some(("wl_data_offer".to_string(), expected)));
+        assert!(!h.c(a.pc.index).is_disconnected());
+        assert_good_client_works(&mut h, &good);
+    }
+}
+
+#[test]
+fn an_owner_quitting_with_both_selections_empties_both() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let b = prim_client(&mut h);
+    let a = prim_client(&mut h);
+    focus(&mut h, &a.clip);
+    copy_now(&mut h, &a.clip, &["text/plain"]);
+    let serial = release_serial(&mut h, &a);
+    select(&mut h, &a, &["text/plain"], serial);
+    focus(&mut h, &b.clip);
+    assert!(
+        last_selection(h.c(b.clip.pc.index), &b.clip.device)
+            .flatten()
+            .is_some()
+    );
+    assert!(
+        last_primary(h.c(b.clip.pc.index), &b.device)
+            .flatten()
+            .is_some()
+    );
+    drop(a);
+    let client = h.clients.remove(2);
+    drop(client);
+    h.roundtrip();
+    assert_eq!(
+        last_selection(h.c(b.clip.pc.index), &b.clip.device),
+        Some(None)
+    );
+    assert_eq!(last_primary(h.c(b.clip.pc.index), &b.device), Some(None));
+    assert_good_client_works(&mut h, &good);
 }

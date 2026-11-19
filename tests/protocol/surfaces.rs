@@ -126,6 +126,7 @@ fn globals_and_versions_match_the_contract() {
         .collect();
     globals.sort();
     let expected = [
+        ("ext_data_control_manager_v1", 1),
         ("wl_compositor", 6),
         ("wl_data_device_manager", 3),
         // No `wl_output` without a display (tests/protocol/outputs.rs).
@@ -136,9 +137,32 @@ fn globals_and_versions_match_the_contract() {
         ("wp_fractional_scale_manager_v1", 1),
         ("wp_viewporter", 1),
         ("xdg_wm_base", 6),
+        ("zwlr_data_control_manager_v1", 2),
+        ("zwp_primary_selection_device_manager_v1", 1),
     ];
     let expected: Vec<(String, u32)> = expected.iter().map(|(i, v)| (i.to_string(), *v)).collect();
     assert_eq!(globals, expected);
+}
+
+#[test]
+fn without_the_primary_selection_its_global_is_not_offered() {
+    let mut h = Harness::new();
+    h.server.set_primary_selection(false);
+    let c = h.connect();
+    let names: Vec<String> = h
+        .c(c)
+        .state
+        .globals
+        .iter()
+        .map(|(_, i, _)| i.clone())
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|n| n == "zwp_primary_selection_device_manager_v1"),
+        "{names:?}"
+    );
+    assert!(names.iter().any(|n| n == "ext_data_control_manager_v1"));
 }
 
 #[test]
@@ -432,10 +456,10 @@ fn a_popup_is_not_dismissed_at_once_and_wm_requests_are_ignored() {
     );
 }
 
-// --- T016: clipboard stub ------------------------------------------------------------------
+// --- T016: drag-and-drop stays cancelled (clipboard tasks T013) -----------------------------
 
 #[test]
-fn clipboard_stub_accepts_everything_and_offers_nothing() {
+fn a_drag_is_cancelled_at_once_and_its_source_cannot_be_used_again() {
     let mut h = Harness::new();
     let c = h.connect();
     let g = globals(h.c(c));
@@ -443,10 +467,8 @@ fn clipboard_stub_accepts_everything_and_offers_nothing() {
     let seat: WlSeat = h.c(c).bind(8);
     let qh = h.c(c).qh.clone();
     let device = manager.get_data_device(&seat, &qh, ());
-    let source = manager.create_data_source(&qh, ());
-    source.offer("text/plain".into());
-    device.set_selection(Some(&source), 1);
     let drag_source: WlDataSource = manager.create_data_source(&qh, ());
+    drag_source.offer("text/plain".into());
     let origin = g.compositor.create_surface(&qh, ());
     device.start_drag(Some(&drag_source), &origin, None, 1);
     h.roundtrip();
@@ -454,20 +476,16 @@ fn clipboard_stub_accepts_everything_and_offers_nothing() {
     assert!(!c_ref.is_disconnected(), "{:?}", c_ref.error());
     assert!(
         c_ref
-            .events::<wayland_client::protocol::wl_data_device::Event>()
-            .is_empty()
-    );
-    assert!(
-        c_ref
             .events::<wl_data_source::Event>()
             .iter()
             .any(|(id, e)| *id == drag_source.id()
                 && matches!(e, wl_data_source::Event::Cancelled))
     );
-    source.destroy();
-    device.release();
+    // Using it again is not an error for wl_data_device (the protocol says "may"; Firefox
+    // reuses sources and must not be disconnected for it, clipboard research C8).
+    device.set_selection(Some(&drag_source), 1);
     h.roundtrip();
-    assert!(!h.c(c).is_disconnected());
+    assert!(!h.c(c).is_disconnected(), "{:?}", h.c(c).error());
 }
 
 // --- T017: frame pacing --------------------------------------------------------------------

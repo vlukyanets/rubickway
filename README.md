@@ -103,6 +103,14 @@ application closes it and goes no further, as in GNOME or KDE; a click on the ap
 windows reaches them. Any RubickWay action closes all open menus first: a shortcut, moving or
 resizing a window, panning or zooming, focus moving to another window, maximize or fullscreen.
 
+Copy and paste work between applications, wherever their windows are on the canvas. Text
+selected with the mouse pastes with a middle click in another application (the primary
+selection), separately from what Ctrl+C copied; `primary-selection off` in the configuration
+switches that off. Clipboard tools work too: `wl-copy` and `wl-paste`, history managers such as
+cliphist, and wl-clip-persist to keep copied content after its application closes, since
+RubickWay itself keeps no copy. Any program may use these tools' protocols, so any program can
+read the clipboard. Dragging between windows (drag-and-drop) is not there yet.
+
 ## Configuration
 
 `~/.config/rubickway/config.kdl` (or `$XDG_CONFIG_HOME/rubickway/config.kdl`), in
@@ -130,6 +138,9 @@ binds {
 
 // Seconds without a response from the event loop before RubickWay ends itself.
 watchdog-timeout-sec 10
+
+// Middle-click paste (the primary selection): on or off.
+primary-selection on
 ```
 
 Spawn and pointer defaults are replaced separately: binding only pointer gestures keeps

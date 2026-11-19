@@ -1,5 +1,6 @@
 //! Protocol tests: the real server, in-process, with `wayland-client` test clients.
 
+mod clipboard;
 mod commits;
 mod cursor_shape;
 mod dmabuf;
