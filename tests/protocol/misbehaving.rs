@@ -7,6 +7,7 @@ use std::os::fd::AsFd;
 
 use rubickway::canvas::Size;
 use rubickway::shell::{ClientInput, States, WindowCommand, WindowEvent, WindowId};
+use rubickway::shell::{IRect, place};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_keyboard;
 use wayland_client::protocol::wl_seat::WlSeat;
@@ -16,6 +17,8 @@ use wayland_client::{Connection, Proxy};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{
     self, Flags, ZwpLinuxBufferParamsV1,
 };
+use wayland_protocols::xdg::shell::client::xdg_positioner::{self, XdgPositioner};
+use wayland_protocols::xdg::shell::client::xdg_surface;
 use wayland_protocols::xdg::shell::client::xdg_toplevel;
 
 use rubickway::shell::CursorName;
@@ -986,5 +989,128 @@ fn a_client_gone_with_its_shape_shown_leaves_nothing_behind() {
     assert_eq!(
         h.server.take_window_events(),
         vec![shape(next.id, CursorName::Pointer)]
+    );
+}
+
+// --- popups: positioner values (popups contracts/protocols.md "xdg_positioner") -------------
+
+const INVALID_INPUT: u32 = xdg_positioner::Error::InvalidInput as u32;
+
+#[test]
+fn positioner_values_outside_the_protocol_disconnect_only_the_offender() {
+    type Bad = fn(&XdgPositioner);
+    let cases: [(&str, Bad); 5] = [
+        ("anchor 9", |p| {
+            p.send_request(xdg_positioner::Request::SetAnchor {
+                anchor: wayland_client::WEnum::Unknown(9),
+            })
+            .expect("send");
+        }),
+        ("gravity u32::MAX", |p| {
+            p.send_request(xdg_positioner::Request::SetGravity {
+                gravity: wayland_client::WEnum::Unknown(u32::MAX),
+            })
+            .expect("send");
+        }),
+        ("adjustment bit 0x40", |p| {
+            p.send_request(xdg_positioner::Request::SetConstraintAdjustment {
+                constraint_adjustment: wayland_client::WEnum::Unknown(0x40),
+            })
+            .expect("send");
+        }),
+        ("negative parent width", |p| p.set_parent_size(-1, 5)),
+        ("negative parent height", |p| p.set_parent_size(5, -1)),
+    ];
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    for (what, bad) in cases {
+        let ci = h.connect();
+        let g = globals(h.c(ci));
+        let qh = h.c(ci).qh.clone();
+        let positioner = g.wm_base.create_positioner(&qh, ());
+        bad(&positioner);
+        h.roundtrip();
+        assert_eq!(shm_error(&mut h, ci), Some(INVALID_INPUT), "{what}");
+    }
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn every_protocol_positioner_value_is_accepted() {
+    let mut h = Harness::new();
+    let ci = h.connect();
+    let g = globals(h.c(ci));
+    let qh = h.c(ci).qh.clone();
+    let p = g.wm_base.create_positioner(&qh, ());
+    for v in 0..=8 {
+        for request in [
+            xdg_positioner::Request::SetAnchor {
+                anchor: wayland_client::WEnum::Unknown(v),
+            },
+            xdg_positioner::Request::SetGravity {
+                gravity: wayland_client::WEnum::Unknown(v),
+            },
+        ] {
+            p.send_request(request).expect("send");
+        }
+    }
+    p.send_request(xdg_positioner::Request::SetConstraintAdjustment {
+        constraint_adjustment: wayland_client::WEnum::Unknown(0x3f),
+    })
+    .expect("send");
+    p.set_parent_size(0, 0);
+    p.set_offset(i32::MIN, i32::MAX);
+    p.set_reactive();
+    p.set_parent_configure(7);
+    h.roundtrip();
+    assert!(!h.c(ci).is_disconnected(), "{:?}", h.c(ci).error());
+}
+
+// --- popups: the rest of contracts/protocols.md "Misbehaving clients" (tasks T035) ----------
+// Commits after `popup_done` and a client gone with a grab open are in `popups.rs`
+// (`a_dismissed_popup_is_never_shown_again`, `a_client_gone_with_a_grab_open_leaves_no_popup_behind`).
+
+#[test]
+fn huge_positioner_values_are_placed_with_saturation() {
+    let mut h = Harness::new();
+    let pc = crate::popups::popup_client(&mut h);
+    let c = h.c(pc.index);
+    let p = pc.g.wm_base.create_positioner(&c.qh, ());
+    p.set_size(i32::MAX, i32::MAX);
+    p.set_anchor_rect(i32::MAX, i32::MIN, i32::MAX, i32::MAX);
+    p.set_anchor(xdg_positioner::Anchor::BottomRight);
+    p.set_gravity(xdg_positioner::Gravity::BottomRight);
+    p.set_offset(i32::MAX, i32::MIN);
+    p.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::all());
+    let popup =
+        crate::popups::create_popup(&mut h, pc.index, &pc.g, Some(&pc.window.xdg), &p, None);
+    let Some(WindowEvent::PopupRequested { id, rules, .. }) = crate::popups::requested(&mut h)
+    else {
+        panic!("no PopupRequested");
+    };
+    // What the shell answers, against a view of the window.
+    let at = place(&rules, Some(IRect::new(-1000, -1000, 3000, 3000)));
+    assert!(at.w >= 1 && at.h >= 1, "{at:?}");
+    crate::popups::place(&mut h, id, at);
+    crate::popups::show(&mut h, pc.index, &pc.g, &popup, 10, 10);
+    assert!(
+        !h.c(pc.index).is_disconnected(),
+        "{:?}",
+        h.c(pc.index).error()
+    );
+}
+
+#[test]
+fn a_popup_acking_a_serial_never_sent_is_an_error() {
+    let mut h = Harness::new();
+    let pc = crate::popups::popup_client(&mut h);
+    let p = crate::popups::positioner(h.c(pc.index), &pc.g, (30, 40), (10, 20, 0, 0));
+    let popup =
+        crate::popups::create_popup(&mut h, pc.index, &pc.g, Some(&pc.window.xdg), &p, None);
+    popup.xdg.ack_configure(0xdead);
+    h.roundtrip();
+    assert_eq!(
+        shm_error(&mut h, pc.index),
+        Some(xdg_surface::Error::InvalidSerial as u32)
     );
 }

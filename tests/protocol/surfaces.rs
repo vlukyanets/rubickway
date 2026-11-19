@@ -403,8 +403,9 @@ fn null_buffer_and_destroy_unmap() {
     assert!(!h.c(c).is_disconnected());
 }
 
+/// Popups are no longer dismissed at once: their life is in `tests/protocol/popups.rs`.
 #[test]
-fn popups_are_dismissed_and_wm_requests_ignored() {
+fn a_popup_is_not_dismissed_at_once_and_wm_requests_are_ignored() {
     let mut h = Harness::new();
     let c = h.connect();
     let g = globals(h.c(c));
@@ -424,7 +425,7 @@ fn popups_are_dismissed_and_wm_requests_ignored() {
     h.roundtrip();
     assert!(!h.c(c).is_disconnected(), "{:?}", h.c(c).error());
     assert!(
-        h.c(c)
+        !h.c(c)
             .events::<xdg_popup::Event>()
             .iter()
             .any(|(_, e)| matches!(e, xdg_popup::Event::PopupDone))

@@ -4,7 +4,7 @@
 use crate::canvas::{Point, Rect, Size, Vector};
 use crate::input::{Modifiers, RawModifiers, ScrollSource};
 
-use super::{Edges, WindowId};
+use super::{AppId, Edges, PopupId, WindowId};
 
 /// Input for an application's window, in window coordinates (backend-neutral).
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +50,13 @@ pub enum ClientInput {
         window: WindowId,
         raw: RawModifiers,
     },
+    /// Moves the keyboard focus within `window`: to one of its popups (the topmost grabbing one),
+    /// or back to the window itself with `None`. The focused window and its `activated` state do
+    /// not change (popups research P7).
+    PopupKeyboard {
+        window: WindowId,
+        popup: Option<PopupId>,
+    },
 }
 
 /// A button pressed on a window: it gets all pointer input until the last button is released.
@@ -57,6 +64,18 @@ pub enum ClientInput {
 pub(crate) struct Grab {
     pub window: WindowId,
     pub buttons: Vec<u32>,
+}
+
+/// An application's chain of grabbing popups (popups data-model "PopupGrab"): its surfaces get
+/// the pointer, and the topmost shown one the keyboard, until the chain is empty.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PopupGrab {
+    pub app: AppId,
+    pub window: WindowId,
+    /// Grabbing popups, bottom to top.
+    pub chain: Vec<PopupId>,
+    /// The popup the keyboard was given to, if any.
+    pub keyboard: Option<PopupId>,
 }
 
 /// An interactive operation on a window (research W3).
@@ -114,6 +133,10 @@ pub(crate) struct Router {
     pub raw: RawModifiers,
     /// The first press of the two-press quit, if one is pending (FR-031).
     pub quit: QuitConfirm,
+    /// The open popup grab, if any (popups research P6).
+    pub popup_grab: Option<PopupGrab>,
+    /// Buttons whose press closed a grab's popups: their releases are swallowed (FR-009).
+    pub swallowed: Vec<u32>,
 }
 
 /// The two-press quit (FR-031, data-model "QuitConfirm").

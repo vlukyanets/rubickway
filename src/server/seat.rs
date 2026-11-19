@@ -3,6 +3,7 @@
 //! The shell decides which window gets what ([`ClientInput`]); this module turns that into
 //! protocol events for the right surface of that window, with serials and timestamps.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd};
 
@@ -16,11 +17,11 @@ use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, 
 
 use super::compositor::{self, Role};
 use super::dmabuf::client_number;
-use super::{ServerState, xdg_shell};
+use super::{ServerState, popup, xdg_shell};
 use crate::canvas::Point;
 use crate::ffi::shm_map::sealed_memfd;
 use crate::input::{RawModifiers, ScrollSource};
-use crate::shell::{AppCursor, ClientInput, CursorName, WindowEvent, WindowId};
+use crate::shell::{AppCursor, ClientInput, CursorName, PopupId, WindowEvent, WindowId};
 
 pub(crate) fn create_global(dh: &DisplayHandle) {
     dh.create_global::<ServerState, WlSeat, ()>(8, ());
@@ -54,6 +55,9 @@ pub(crate) struct SeatState {
     enter_serial: Option<u32>,
     /// What the focused client asked for since that enter.
     focus_cursor: AppCursor,
+    /// Per application, the serial of its latest button press and of its latest key press or
+    /// release: a popup grab must carry one of them (popups research P9).
+    popup_serials: HashMap<ClientId, (Option<u32>, Option<u32>)>,
 }
 
 /// The cursor at each enter, until the client asks for something (cursor-shapes FR-003).
@@ -76,7 +80,46 @@ impl Default for SeatState {
             pointer_window: None,
             enter_serial: None,
             focus_cursor: ENTER_CURSOR,
+            popup_serials: HashMap::new(),
         }
+    }
+}
+
+/// Whether `serial` is `client`'s latest button press or latest key press or release (popups
+/// research P9).
+pub(crate) fn grab_serial_ok(state: &ServerState, client: &ClientId, serial: u32) -> bool {
+    state
+        .seat
+        .popup_serials
+        .get(client)
+        .is_some_and(|(button, key)| *button == Some(serial) || *key == Some(serial))
+}
+
+/// Remembers a serial that may start a popup grab: a button press (`button`) or a key event.
+fn note_user_serial(state: &mut ServerState, surface: &WlSurface, serial: u32, button: bool) {
+    let Some(client) = surface.client().map(|c| c.id()) else {
+        return;
+    };
+    let SeatState {
+        pointers,
+        keyboards,
+        popup_serials,
+        ..
+    } = &mut state.seat;
+    // Applications that are gone have no live input objects left: forget them.
+    popup_serials.retain(|c, _| {
+        pointers
+            .iter()
+            .any(|p| p.is_alive() && p.client().is_some_and(|x| x.id() == *c))
+            || keyboards
+                .iter()
+                .any(|k| k.is_alive() && k.client().is_some_and(|x| x.id() == *c))
+    });
+    let entry = popup_serials.entry(client).or_default();
+    if button {
+        entry.0 = Some(serial);
+    } else {
+        entry.1 = Some(serial);
     }
 }
 
@@ -141,29 +184,30 @@ fn keyboards_for<'a>(
         .filter(move |k| k.is_alive() && same_client(*k, surface))
 }
 
-/// The surface of `window` under window point `pos`, with `pos` relative to it.
+/// The surface of `window` (its own or a popup's) under window point `pos`, with `pos` relative
+/// to it; the window's root surface if none accepts input there.
 fn surface_at(state: &ServerState, window: WindowId, pos: Point) -> Option<(WlSurface, Point)> {
-    let root = state.windows.get(&window)?;
-    let origin = root_origin(state, root);
-    let (id, local) = compositor::surface_at(state, root, origin, pos)
+    let layers = popup::layers(state, window);
+    let (root, origin) = layers.first()?;
+    let (id, local) = layers
+        .iter()
+        .rev()
+        .find_map(|(top, at)| compositor::surface_at(state, top, *at, pos))
         .unwrap_or_else(|| (root.clone(), Point::new(pos.x - origin.x, pos.y - origin.y)));
     let surface = state.surfaces.get(&id)?.resource.clone();
     Some((surface, local))
 }
 
-/// Window coordinates of a window's root surface origin.
-fn root_origin(state: &ServerState, root: &ObjectId) -> Point {
-    let geometry = xdg_shell::geometry_of(state, root);
-    Point::new(-geometry.origin.x, -geometry.origin.y)
-}
-
 /// `pos` (window coordinates of `window`) relative to `surface`.
 fn relative_to(state: &ServerState, window: WindowId, surface: &WlSurface, pos: Point) -> Point {
-    let Some(root) = state.windows.get(&window) else {
+    let layers = popup::layers(state, window);
+    let Some((_, origin)) = layers.first() else {
         return pos;
     };
-    let origin = root_origin(state, root);
-    let at = compositor::surface_origin(state, root, origin, &surface.id()).unwrap_or(origin);
+    let at = layers
+        .iter()
+        .find_map(|(top, at)| compositor::surface_origin(state, top, *at, &surface.id()))
+        .unwrap_or(*origin);
     Point::new(pos.x - at.x, pos.y - at.y)
 }
 
@@ -219,7 +263,10 @@ pub(crate) fn deliver(state: &mut ServerState, inputs: &[ClientInput], time_ms: 
             }
             ClientInput::PointerMotion { window, pos } => {
                 let current = state.seat.pointer_surface.clone();
-                let grabbed = !state.seat.buttons_down.is_empty();
+                // With a popup grab the pointer moves between the window's surfaces even with a
+                // button held: press on a menu button, release on an item (popups research P6).
+                let grabbed =
+                    !state.seat.buttons_down.is_empty() && !popup::has_grab(state, *window);
                 let (surface, local) = match (&current, grabbed) {
                     (Some(s), true) => (s.clone(), relative_to(state, *window, s, *pos)),
                     _ => match surface_at(state, *window, *pos) {
@@ -255,6 +302,7 @@ pub(crate) fn deliver(state: &mut ServerState, inputs: &[ClientInput], time_ms: 
                 let serial = state.next_serial();
                 if *pressed {
                     state.seat.last_press = Some((*window, serial));
+                    note_user_serial(state, &surface, serial, true);
                 } else if state.seat.buttons_down.is_empty() {
                     // Only a press still held counts for move and resize (FR-016).
                     state.seat.last_press = None;
@@ -317,6 +365,9 @@ pub(crate) fn deliver(state: &mut ServerState, inputs: &[ClientInput], time_ms: 
                 }
             }
             ClientInput::KeyboardFocus(window) => keyboard_focus(state, *window),
+            ClientInput::PopupKeyboard { window, popup } => {
+                popup_keyboard(state, *window, *popup);
+            }
             ClientInput::Key {
                 keycode, pressed, ..
             } => {
@@ -329,6 +380,7 @@ pub(crate) fn deliver(state: &mut ServerState, inputs: &[ClientInput], time_ms: 
                     continue;
                 };
                 let serial = state.next_serial();
+                note_user_serial(state, &surface, serial, false);
                 let key_state = if *pressed {
                     wl_keyboard::KeyState::Pressed
                 } else {
@@ -396,6 +448,38 @@ fn keyboard_focus(state: &mut ServerState, window: Option<WindowId>) {
     xdg_shell::set_activated(state, window, true);
 }
 
+/// Moves the keyboard within the focused `window`: to its shown popup `popup`, or back to its
+/// root surface (popups research P7). The focused window and `activated` do not change.
+fn popup_keyboard(state: &mut ServerState, window: WindowId, popup: Option<PopupId>) {
+    if state.seat.keyboard_window != Some(window) {
+        return;
+    }
+    let target = match popup {
+        Some(id) => popup::surface_of(state, window, id),
+        None => state.windows.get(&window).cloned(),
+    };
+    let Some(surface) = target.and_then(|t| state.surfaces.get(&t).map(|s| s.resource.clone()))
+    else {
+        return;
+    };
+    if state.seat.keyboard_surface.as_ref() == Some(&surface) {
+        return;
+    }
+    if let Some(old) = state.seat.keyboard_surface.take() {
+        let serial = state.next_serial();
+        for k in keyboards_for(state, &old) {
+            k.leave(serial, &old);
+        }
+    }
+    let serial = state.next_serial();
+    let keys = pressed_keys_array(state);
+    for k in keyboards_for(state, &surface) {
+        k.enter(serial, &surface, keys.clone());
+    }
+    send_modifiers(state, &surface);
+    state.seat.keyboard_surface = Some(surface);
+}
+
 /// A new keymap: sent to every keyboard and kept for new ones.
 pub(crate) fn set_keymap(state: &mut ServerState, text: &str) {
     match sealed_memfd(text) {
@@ -449,7 +533,15 @@ pub(crate) fn surface_destroyed(state: &mut ServerState, surface: &ObjectId) {
         .is_some_and(|s| s.id() == *surface)
     {
         state.seat.keyboard_surface = None;
-        state.seat.keyboard_window = None;
+        // A popup's surface going away leaves its window focused; the shell moves the keyboard
+        // back to the window (`PopupKeyboard`).
+        if state
+            .seat
+            .keyboard_window
+            .is_none_or(|w| state.windows.get(&w).is_none_or(|root| root == surface))
+        {
+            state.seat.keyboard_window = None;
+        }
     }
 }
 

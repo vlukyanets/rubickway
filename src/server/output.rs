@@ -5,7 +5,7 @@ use wayland_server::backend::{ClientId, GlobalId, ObjectId};
 use wayland_server::protocol::wl_output::{self, WlOutput};
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
-use super::{ServerState, compositor};
+use super::{ServerState, compositor, popup};
 use crate::canvas::ViewerId;
 use crate::shell::WindowId;
 
@@ -88,21 +88,15 @@ pub(crate) fn remove(state: &mut ServerState, id: u32) {
 /// Sends `enter` (or `leave`) of display `id` to every surface of `window` (its root and
 /// subsurfaces), for each of the client's objects of that output.
 fn cross(state: &ServerState, window: WindowId, id: u32, enter: bool) {
-    let Some(root) = state.windows.get(&window) else {
-        return;
-    };
-    cross_tree(state, root, id, enter);
+    for (root, _) in popup::layers(state, window) {
+        cross_tree(state, &root, id, enter);
+    }
 }
 
-/// A subsurface just joined a window's tree (`enter`) or is about to leave it (`leave`): it,
-/// and its own subsurfaces, enter or leave the displays its window is on (FR-015).
+/// A subsurface or popup just joined a window's layers (`enter`) or is about to leave them
+/// (`leave`): it, and its own subsurfaces, enter or leave the displays its window is on (FR-015).
 pub(crate) fn cross_subtree(state: &ServerState, sub: &ObjectId, enter: bool) {
-    let Some(window) = state
-        .windows
-        .iter()
-        .find(|(_, root)| compositor::tree(state, root).contains(sub))
-        .map(|(w, _)| *w)
-    else {
+    let Some(window) = popup::window_of_surface(state, sub) else {
         return;
     };
     for id in state.window_outputs.get(&window).into_iter().flatten() {
