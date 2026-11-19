@@ -37,6 +37,31 @@ The full check, the same as CI:
 cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked && cargo test --release --locked
 ```
 
+### In a container
+
+`.devcontainer/` holds a dev container on Debian with the system libraries and the pinned
+toolchain: the same image CI builds and runs the full check in, so what passes in the
+container passes in CI. It needs Docker. Open the repository root (not a worktree folder) in
+an editor with Dev Containers support, or use the
+[devcontainer CLI](https://github.com/devcontainers/cli) 0.90 or newer from the host (0.80
+hangs at start with Docker 29):
+
+```sh
+devcontainer up --workspace-folder .
+devcontainer exec --workspace-folder . cargo test
+```
+
+- The repository is mounted at the same path as on the host, so worktrees under
+  `.claude/worktrees/` work inside too. Crates and build output (`/home/dev/target`) live in
+  Docker volumes, apart from the host's `target/`.
+- Outgoing connections are limited to GitHub, crates.io, the Rust toolchain servers, the
+  Debian archive and the editor's servers (`.devcontainer/init-firewall.sh`; add a domain
+  there and rebuild).
+- RubickWay itself runs on the hardware: build and start it on the host (below).
+- The packages come from a dated Debian snapshot (`DEBIAN_SNAPSHOT` in the Dockerfile).
+  Update it together with the base image digest, never the digest alone: the snapshot's
+  `-dev` packages must not be older than the base image's libraries.
+
 ## Starting RubickWay
 
 Log in on a text console (for example tty1, reached with Ctrl+Alt+F1 from a desktop) and run

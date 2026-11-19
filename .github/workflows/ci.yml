@@ -13,15 +13,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Installs the toolchain and components pinned in rust-toolchain.toml.
-      - run: rustup toolchain install
-      # System libraries: Wayland and xkbcommon to link, EGL/GLES + Mesa (llvmpipe) for the
-      # rendering tests, xkb-data for the keymap tests; libinput, libseat, libgbm and libudev
-      # for the standalone backend.
+      # The devcontainer's image (.devcontainer/Dockerfile): system libraries and the toolchain
+      # pinned in rust-toolchain.toml. Its layers come from the Actions cache until the
+      # Dockerfile, its Debian snapshot or the toolchain changes.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: .devcontainer/Dockerfile
+          load: true
+          tags: rubickway-dev:ci
+          cache-from: type=gha,scope=dev-image
+          cache-to: type=gha,mode=max,scope=dev-image
+      # Downloaded crates and build output, kept until Cargo.lock, the toolchain or the image
+      # changes.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo-ci/registry
+            target
+          key: cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.devcontainer/Dockerfile') }}
+          restore-keys: cargo-
+      # Every check runs in the image, as the runner's user, on the checked-out tree.
       - run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libegl-dev libgles-dev libegl-mesa0 xkb-data libinput-dev libseat-dev libgbm-dev libudev-dev
-      - run: cargo fetch --locked
-      - run: cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
-      - run: cargo test --release --locked
+          mkdir -p ~/.cargo-ci/registry
+          echo "IN_IMAGE=docker run --rm --user $(id -u):$(id -g) -e HOME=/tmp -e CARGO_INCREMENTAL=0 -v $PWD:$PWD -w $PWD -v $HOME/.cargo-ci/registry:/opt/cargo/registry rubickway-dev:ci" >> "$GITHUB_ENV"
+      - run: $IN_IMAGE cargo fetch --locked
+      - run: $IN_IMAGE bash -c 'cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings'
+      - run: $IN_IMAGE cargo test --locked
+      - run: $IN_IMAGE cargo test --release --locked

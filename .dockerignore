@@ -1,0 +1,5 @@
+# The image (.devcontainer/Dockerfile) needs only these; everything else stays out of the build
+# context, so code changes never invalidate its cached layers.
+*
+!rust-toolchain.toml
+!.devcontainer/

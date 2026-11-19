@@ -136,3 +136,9 @@ itself is the point (user-facing copy that needs it, tests for Unicode handling)
 - **Hardware code** (`src/backend/drm/`) cannot run in tests or CI (no seat, no card): keep its
   decisions in pure functions with unit tests, and check the rest through the feature's
   `quickstart.md` on real hardware, started from a text console.
+- **One image for CI and the dev container** (`.devcontainer/Dockerfile`, Debian): a system
+  package a build or test needs goes there, and that is how CI gets it - `ci.yml` installs
+  nothing itself. Its packages come from a dated Debian snapshot; bump `DEBIAN_SNAPSHOT` and
+  the base image digest together. Commands from the host run in it with
+  `devcontainer exec --workspace-folder . <command>`, opened at the repository root (it is
+  mounted at the host path, so worktrees work inside).
