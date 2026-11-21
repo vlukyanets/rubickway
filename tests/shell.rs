@@ -2119,6 +2119,8 @@ fn moved(s: &mut Shell, dx: f64, dy: f64) -> Vec<ClientInput> {
         s,
         InputEvent::PointerMoved {
             delta: Vector::new(dx, dy),
+            unaccel: Vector::new(dx, dy),
+            time_us: 0,
         },
     )
 }
@@ -4047,4 +4049,24 @@ fn a_menu_changing_its_size_places_its_reactive_submenus_again() {
         placements(&s.take_commands()).is_empty(),
         "the same size again changes nothing"
     );
+}
+
+// --- Pointer lock: the release shortcut (pointer-lock FR-008, research L7) -------------------
+
+const KEY_ESC: u32 = 1;
+
+#[test]
+fn mod_escape_is_consumed_and_changes_nothing_while_nothing_holds_the_pointer() {
+    let mut s = shell_with_window();
+    motion(&mut s, 450.0, 375.0);
+    mods(&mut s, super_mod(), 64);
+    let commands = s.take_commands();
+    let pointer = s.pointer();
+    let press = key(&mut s, KEY_ESC, Keysym::Escape, true);
+    let release = key(&mut s, KEY_ESC, Keysym::Escape, false);
+    assert!(press.is_empty(), "{press:?}");
+    assert!(release.is_empty(), "{release:?}");
+    assert!(s.take_commands().is_empty(), "{commands:?}");
+    assert_eq!(s.pointer(), pointer);
+    assert_eq!(s.windows().focus(), Some(w(1)));
 }

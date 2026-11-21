@@ -387,12 +387,91 @@ fn set_cursor_without_a_surface_hides_the_pointer_over_the_clients_windows() {
     h.roundtrip();
     assert!(h.server.take_window_events().is_empty());
     let image = g.compositor.create_surface(&h.c(c).qh, ());
+    let (buffer, _pool, _file) = solid_buffer(h.c(c), &g.shm, 8, 8, RED);
+    image.attach(Some(&buffer), 0, 0);
+    image.commit();
     pointer.set_cursor(serial, Some(&image), 0, 0);
     h.roundtrip();
     assert_eq!(
         h.server.take_window_events(),
         vec![cursor_changed(id, AppCursor::Shape(CursorName::Default))]
     );
+    assert!(!h.c(c).is_disconnected());
+}
+
+/// GTK 3 hides the pointer with a cursor surface that has no image, not with `set_cursor(None)`
+/// (Firefox's pointer lock, pointer-lock quickstart Q1): what the cursor surface shows counts,
+/// on every commit of it.
+#[test]
+fn a_cursor_surface_without_an_image_hides_the_pointer() {
+    let mut h = Harness::new();
+    let c = h.connect();
+    let g = globals(h.c(c));
+    let seat: WlSeat = h.c(c).bind(8);
+    let pointer: WlPointer = seat.get_pointer(&h.c(c).qh, ());
+    let (_w, id) = open_window(&mut h, c, &g, 50, 50, RED);
+    let serial = enter_pointer(&mut h, c, id);
+    h.server.take_window_events();
+
+    // A surface that never had an image.
+    let image = g.compositor.create_surface(&h.c(c).qh, ());
+    pointer.set_cursor(serial, Some(&image), 0, 0);
+    h.roundtrip();
+    assert_eq!(
+        h.server.take_window_events(),
+        vec![cursor_changed(id, AppCursor::Hidden)]
+    );
+
+    // An image committed on it: the arrow; the image removed again: hidden.
+    let (buffer, _pool, _file) = solid_buffer(h.c(c), &g.shm, 8, 8, RED);
+    image.attach(Some(&buffer), 0, 0);
+    image.commit();
+    h.roundtrip();
+    assert_eq!(
+        h.server.take_window_events(),
+        vec![cursor_changed(id, AppCursor::Shape(CursorName::Default))]
+    );
+    image.attach(None, 0, 0);
+    image.commit();
+    h.roundtrip();
+    assert_eq!(
+        h.server.take_window_events(),
+        vec![cursor_changed(id, AppCursor::Hidden)]
+    );
+
+    // GTK's order: set_cursor with the surface still showing an image, then the image removed.
+    image.attach(Some(&buffer), 0, 0);
+    image.commit();
+    h.roundtrip();
+    h.server.take_window_events();
+    pointer.set_cursor(serial, Some(&image), 0, 0);
+    image.attach(None, 0, 0);
+    image.commit();
+    h.roundtrip();
+    assert_eq!(
+        h.server.take_window_events(),
+        vec![cursor_changed(id, AppCursor::Hidden)]
+    );
+
+    // Once the surface is no longer the cursor (another request, a new enter), its commits
+    // change nothing.
+    pointer.set_cursor(serial, None, 0, 0);
+    image.attach(Some(&buffer), 0, 0);
+    image.commit();
+    h.roundtrip();
+    assert!(h.server.take_window_events().is_empty());
+    pointer.set_cursor(serial, Some(&image), 0, 0);
+    h.roundtrip();
+    assert_eq!(
+        h.server.take_window_events(),
+        vec![cursor_changed(id, AppCursor::Shape(CursorName::Default))]
+    );
+    enter_pointer(&mut h, c, id);
+    h.server.take_window_events();
+    image.attach(None, 0, 0);
+    image.commit();
+    h.roundtrip();
+    assert!(h.server.take_window_events().is_empty());
     assert!(!h.c(c).is_disconnected());
 }
 

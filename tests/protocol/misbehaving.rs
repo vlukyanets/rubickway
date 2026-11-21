@@ -34,8 +34,18 @@ use crate::cursor_shape::{set_raw_shape, shape, shape_client};
 use crate::dmabuf::{ARGB, dmabuf, gpu_harness, immed, imports_succeed};
 use crate::harness::{Harness, solid_buffer, temp_file};
 use crate::input::enter_pointer;
-use crate::surfaces::{Window, globals, open_window};
+use crate::pointer_constraints::{
+    LockClient, decide, lock_client, locked_events, one_report, reports,
+};
+use crate::surfaces::{Window, create_window, globals, open_window};
 use crate::syncobj::{Sync, sync_client, sync_harness};
+use rubickway::canvas::{Point, Rect, Vector, ViewerId};
+use rubickway::input::{Button, InputEvent, Keysym, Modifiers, RawModifiers};
+use rubickway::shell::{AppId, ConstraintChange, ConstraintEnd, Shell, SizeLimits};
+use wayland_client::protocol::wl_pointer;
+use wayland_client::protocol::wl_region::WlRegion;
+use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::Lifetime;
+use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1;
 
 const RED: u32 = 0xffff_0000;
 
@@ -1255,4 +1265,355 @@ fn an_owner_quitting_with_both_selections_empties_both() {
     );
     assert_eq!(last_primary(h.c(b.clip.pc.index), &b.device), Some(None));
     assert_good_client_works(&mut h, &good);
+}
+
+// --- Pointer lock (pointer-lock contracts/protocols.md M1 - M11, SC-005) -------------------
+//
+// M1 - M5 and M7 are tested in `pointer_constraints.rs`; here each misbehaviour runs once more
+// beside a well-behaved client, which must keep working.
+
+/// A region of `n` disjoint 1x1 rectangles, a grid 100 wide.
+fn many_rects(h: &mut Harness, c: &LockClient, n: i32) -> WlRegion {
+    let qh = h.c(c.index).qh.clone();
+    let region = c.g.compositor.create_region(&qh, ());
+    for i in 0..n {
+        region.add((i % 100) * 2, (i / 100) * 2, 1, 1);
+    }
+    region
+}
+
+#[test]
+fn m1_a_second_constraint_on_a_surface_ends_only_that_client() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let bad = lock_client(&mut h);
+    let _first = bad.lock(&mut h, None, Lifetime::Persistent);
+    let _second = bad.lock(&mut h, None, Lifetime::Oneshot);
+    h.roundtrip();
+    assert_eq!(h.c(bad.index).error().map(|e| e.code), Some(1));
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn m2_m3_m4_m5_odd_but_valid_constraints_leave_others_alone() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let c = lock_client(&mut h);
+    // M2: a new one after a single-use one went defunct.
+    let _lock = c.lock(&mut h, None, Lifetime::Oneshot);
+    h.roundtrip();
+    let token = one_report(&mut h).1.expect("a constraint").token;
+    decide(&mut h, token, ConstraintChange::Start);
+    decide(&mut h, token, ConstraintChange::Stop(ConstraintEnd::Focus));
+    let _again = c.lock(&mut h, None, Lifetime::Oneshot);
+    // M3: on a surface without a role.
+    let qh = h.c(c.index).qh.clone();
+    let bare = c.g.compositor.create_surface(&qh, ());
+    c.constraints
+        .confine_pointer(&bare, &c.pointer, None, Lifetime::Persistent, &qh, ());
+    // M4: on a window not shown yet.
+    let hidden = create_window(&mut h, c.index, &c.g);
+    let lock = c.constraints.lock_pointer(
+        &hidden.surface,
+        &c.pointer,
+        None,
+        Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    h.roundtrip();
+    let got = reports(&h.server.take_window_events());
+    assert_eq!(
+        got.len(),
+        1,
+        "only the new lock on the shown window: {got:?}"
+    );
+    // M5: the surface destroyed while the lock is live, then requests on the lock.
+    hidden.toplevel.destroy();
+    hidden.xdg.destroy();
+    hidden.surface.destroy();
+    h.roundtrip();
+    lock.set_cursor_position_hint(1.0, 1.0);
+    lock.destroy();
+    h.roundtrip();
+    assert!(!h.c(c.index).is_disconnected());
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn m6_an_area_and_input_shape_of_10000_rectangles_cause_no_error() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let c = lock_client(&mut h);
+    let region = many_rects(&mut h, &c, 10_000);
+    c.window.surface.set_input_region(Some(&region));
+    let confine = c.confine(&mut h, Some(&region), Lifetime::Persistent);
+    confine.set_region(Some(&region));
+    c.window.surface.commit();
+    h.roundtrip();
+    let events = h.server.take_window_events();
+    let area = reports(&events)
+        .last()
+        .and_then(|(_, i)| i.clone())
+        .and_then(|i| i.area)
+        .expect("an area");
+    // Reported as it is; the shell uses the bounding box (research L10).
+    assert_eq!(area.len(), 10_000);
+    assert!(!h.c(c.index).is_disconnected());
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn m7_regions_and_release_points_at_the_limits_leave_others_alone() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let c = lock_client(&mut h);
+    let qh = h.c(c.index).qh.clone();
+    let region = c.g.compositor.create_region(&qh, ());
+    region.add(i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+    region.add(i32::MAX - 1, i32::MAX - 1, i32::MAX, i32::MAX);
+    let lock = c.lock(&mut h, Some(&region), Lifetime::Persistent);
+    lock.set_cursor_position_hint(-8_000_000.0, 8_000_000.0);
+    lock.set_region(Some(&region));
+    c.window.surface.commit();
+    h.roundtrip();
+    assert!(!h.c(c.index).is_disconnected());
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn m8_a_flood_of_constraints_and_region_changes_leaves_others_alone() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let c = lock_client(&mut h);
+    let qh = h.c(c.index).qh.clone();
+    let small = c.g.compositor.create_region(&qh, ());
+    small.add(0, 0, 10, 10);
+    for _ in 0..10_000 {
+        c.lock(&mut h, None, Lifetime::Oneshot).destroy();
+    }
+    let lock = c.lock(&mut h, None, Lifetime::Persistent);
+    for _ in 0..10_000 {
+        lock.set_region(Some(&small));
+        c.window.surface.commit();
+    }
+    h.roundtrip();
+    for _ in 0..20 {
+        h.roundtrip();
+    }
+    assert!(!h.c(c.index).is_disconnected());
+    assert_good_client_works(&mut h, &good);
+}
+
+fn relative_motion_for(h: &mut Harness, window: WindowId) {
+    h.server.deliver(
+        &[
+            ClientInput::RelativeMotion {
+                window,
+                delta: Vector::new(1.0, 1.0),
+                unaccel: Vector::new(1.0, 1.0),
+                time_us: 1,
+            },
+            ClientInput::PointerFrame { window },
+        ],
+        1,
+    );
+}
+
+#[test]
+fn m9_only_32_relative_pointers_of_a_client_are_told_a_motion() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let c = lock_client(&mut h);
+    let all: Vec<_> = (0..10_000).map(|_| c.relative_pointer(&mut h)).collect();
+    h.roundtrip();
+    enter_pointer(&mut h, c.index, c.id);
+    relative_motion_for(&mut h, c.id);
+    h.roundtrip();
+    let told = h
+        .c(c.index)
+        .events::<zwp_relative_pointer_v1::Event>()
+        .len();
+    assert_eq!(told, 32);
+    assert_eq!(all.len(), 10_000);
+    assert_good_client_works(&mut h, &good);
+}
+
+#[test]
+fn m10_a_client_that_never_reads_its_relative_motion_is_disconnected() {
+    let mut h = Harness::new();
+    let good = good_client(&mut h);
+    let c = lock_client(&mut h);
+    let _relative: Vec<_> = (0..32).map(|_| c.relative_pointer(&mut h)).collect();
+    h.roundtrip();
+    enter_pointer(&mut h, c.index, c.id);
+    h.c(c.index).paused = true;
+    let display = h.c(c.index).conn.display();
+    let qh = h.c(c.index).qh.clone();
+    let mut gone = false;
+    for _ in 0..100 {
+        for _ in 0..100 {
+            relative_motion_for(&mut h, c.id);
+        }
+        // A request now and then, so the client notices when the server has closed its socket.
+        display.sync(&qh, ());
+        h.roundtrip();
+        if client_gone(&h.c(c.index).conn) {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "the stuck client is still connected");
+    h.c(c.index).paused = false;
+    assert_good_client_works(&mut h, &good);
+}
+
+/// Hands the server's window events to `shell`, its decisions back to the server and its window
+/// commands too, until nothing is left (the application loop, in small).
+fn settle(h: &mut Harness, shell: &mut Shell) {
+    for _ in 0..8 {
+        h.roundtrip();
+        let events = h.server.take_window_events();
+        let commands = shell.take_commands();
+        h.server.command(&commands);
+        if events.is_empty() && commands.is_empty() {
+            return;
+        }
+        for e in events {
+            let out = shell.apply(e);
+            h.server.deliver(&out, 1);
+        }
+    }
+}
+
+fn shell_input(h: &mut Harness, shell: &mut Shell, event: InputEvent) {
+    let out = shell.handle(&event).1;
+    h.server.deliver(&out, 1);
+    h.roundtrip();
+}
+
+#[test]
+fn m11_mod_escape_frees_the_pointer_from_a_lock_asked_for_again_at_once() {
+    let mut h = Harness::new();
+    let c = lock_client(&mut h);
+    let mut shell = Shell::new();
+    shell.add_viewer(ViewerId(1), Size::new(1000.0, 800.0), true);
+    shell.place_home_views();
+    shell_input(&mut h, &mut shell, InputEvent::FocusGained);
+    let size = Size::new(100.0, 100.0);
+    let out = shell.apply(WindowEvent::Mapped {
+        id: c.id,
+        size,
+        input: vec![Rect::new(Point::new(0.0, 0.0), size)],
+        limits: SizeLimits::default(),
+        parent: None,
+        app: AppId(1),
+    });
+    h.server.deliver(&out, 1);
+    let moved = InputEvent::PointerMoved {
+        delta: Vector::new(0.0, 0.0),
+        unaccel: Vector::new(0.0, 0.0),
+        time_us: 1,
+    };
+    shell_input(&mut h, &mut shell, moved);
+
+    // The application locks (single-use); the shell applies it.
+    let _lock = c.lock(&mut h, None, Lifetime::Oneshot);
+    settle(&mut h, &mut shell);
+    assert_eq!(locked_events(&mut h, c.index), vec!["Locked"]);
+
+    // Mod+Escape; the application asks again as soon as it hears `unlocked`.
+    let logo = Modifiers {
+        logo: true,
+        ..Modifiers::NONE
+    };
+    shell_input(
+        &mut h,
+        &mut shell,
+        InputEvent::Modifiers {
+            mods: logo,
+            raw: RawModifiers::default(),
+        },
+    );
+    let escape = |pressed| InputEvent::Key {
+        keycode: 1,
+        binding_sym: Keysym::Escape,
+        pressed,
+        time_ms: 1,
+    };
+    shell_input(&mut h, &mut shell, escape(true));
+    shell_input(&mut h, &mut shell, escape(false));
+    shell_input(
+        &mut h,
+        &mut shell,
+        InputEvent::Modifiers {
+            mods: Modifiers::NONE,
+            raw: RawModifiers::default(),
+        },
+    );
+    assert_eq!(locked_events(&mut h, c.index), vec!["Locked", "Unlocked"]);
+    let _again = c.lock(&mut h, None, Lifetime::Oneshot);
+    settle(&mut h, &mut shell);
+    assert_eq!(
+        locked_events(&mut h, c.index),
+        vec!["Locked", "Unlocked"],
+        "the pointer stays free"
+    );
+
+    // A click the window receives captures it again.
+    let left = |pressed| InputEvent::PointerButton {
+        button: Button::Left,
+        code: 0x110,
+        pressed,
+    };
+    shell_input(&mut h, &mut shell, left(true));
+    shell_input(&mut h, &mut shell, left(false));
+    assert_eq!(
+        locked_events(&mut h, c.index),
+        vec!["Locked", "Unlocked", "Locked"]
+    );
+}
+
+#[test]
+fn sc005_a_flood_in_one_batch_does_not_delay_another_clients_input() {
+    let mut h = Harness::new();
+    let good = lock_client(&mut h);
+    let bad = lock_client(&mut h);
+    let region = many_rects(&mut h, &bad, 10_000);
+    h.roundtrip();
+    // One batch: 10,000 constraints made and destroyed, an area of 10,000 rectangles, 10,000
+    // relative pointers.
+    for _ in 0..10_000 {
+        bad.lock(&mut h, None, Lifetime::Oneshot).destroy();
+    }
+    let _confine = bad.confine(&mut h, Some(&region), Lifetime::Persistent);
+    let _relative: Vec<_> = (0..10_000).map(|_| bad.relative_pointer(&mut h)).collect();
+    let _ = h.c(bad.index).conn.flush();
+    // One step of the loop: read requests, deliver input, send events.
+    h.server.dispatch().expect("dispatch");
+    h.server.deliver(
+        &[
+            ClientInput::PointerEnter {
+                window: good.id,
+                pos: Point::new(5.0, 5.0),
+            },
+            ClientInput::PointerFrame { window: good.id },
+        ],
+        1,
+    );
+    h.server.flush().expect("flush");
+    let g = h.c(good.index);
+    let _ = g.conn.flush();
+    if let Some(guard) = g.conn.prepare_read() {
+        let _ = guard.read();
+    }
+    let _ = g.queue.dispatch_pending(&mut g.state);
+    assert!(
+        g.events::<wl_pointer::Event>()
+            .iter()
+            .any(|(_, e)| matches!(e, wl_pointer::Event::Enter { .. })),
+        "the other client's input arrived in the same step"
+    );
+    h.roundtrip();
+    assert!(!h.c(bad.index).is_disconnected());
 }

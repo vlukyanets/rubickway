@@ -21,7 +21,7 @@ use super::descriptors;
 use super::dmabuf::{BufferKey, GpuBuffer, ImportState, ShownImage, Wait};
 use super::shm::BufferKind;
 use super::syncobj::{self, SyncPoint, ToRelease};
-use super::{ServerState, SurfaceKey, SurfacePart, seat, shm, xdg_shell};
+use super::{ServerState, SurfaceKey, SurfacePart, pointer_constraints, seat, shm, xdg_shell};
 use crate::canvas::{Point, Rect, Size, Vector};
 pub use crate::render::Transform;
 
@@ -576,7 +576,15 @@ fn apply_transaction(state: &mut ServerState, transaction: Transaction) {
         }
     }
     let tree_root = root_of(state, &transaction.root);
+    if tree_root == transaction.root {
+        // A lock's or confinement's area and release point are double-buffered state of the
+        // surface (pointer-lock research L12).
+        pointer_constraints::apply_pending(state, &tree_root);
+    }
     xdg_shell::tree_committed(state, &tree_root, &transaction.root, transaction.xdg);
+    // After `Mapped` or `Updated`: the shell hears of the window first.
+    pointer_constraints::report_surface(state, &tree_root);
+    seat::surface_committed(state, &tree_root);
 }
 
 /// Whether a subsurface (or one of its ancestors) is in synchronised mode.
@@ -979,6 +987,7 @@ pub(crate) fn announce_scale(state: &ServerState, id: &ObjectId) {
 fn surface_destroyed(state: &mut ServerState, id: &ObjectId) {
     xdg_shell::surface_destroyed(state, id);
     seat::surface_destroyed(state, id);
+    pointer_constraints::surface_destroyed(state, id);
     if let Some(queue) = state.queues.remove(id) {
         state.cancelled_waits.extend(queue.waits());
     }

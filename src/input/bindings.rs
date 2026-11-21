@@ -19,6 +19,9 @@ pub enum Action {
     CloseWindow,
     /// Run the command of spawn binding `n` (FR-014).
     Spawn(usize),
+    /// Take the pointer back from an application that locked or confined it (pointer-lock
+    /// FR-008).
+    ReleasePointer,
 }
 
 /// The modifier used as Mod (FR-005).
@@ -227,6 +230,7 @@ fn builtin_table(mod_key: ModKey) -> Vec<Binding> {
         b(m, Keysym::Tab, Action::NextWindow),
         // The binding symbol is the level-0 symbol, so Shift+Tab still reports `Tab`.
         b(ms, Keysym::Tab, Action::PreviousWindow),
+        b(m, Keysym::Escape, Action::ReleasePointer),
     ]
 }
 
@@ -251,6 +255,11 @@ mod tests {
                 b.lookup(with(m, true), Keysym::Tab, true),
                 Some(Action::PreviousWindow)
             );
+            assert_eq!(
+                b.lookup(m, Keysym::Escape, true),
+                Some(Action::ReleasePointer)
+            );
+            assert_eq!(b.lookup(Modifiers::NONE, Keysym::Escape, true), None);
             assert!(b.mod_held(m));
             assert!(!b.mod_held(Modifiers::NONE));
         }
@@ -288,7 +297,7 @@ mod tests {
         let b = Bindings::default();
         assert_eq!(b.mod_key(), ModKey::Super);
         assert!(b.spawns().is_empty());
-        assert_eq!(b.builtin().len(), 5);
+        assert_eq!(b.builtin().len(), 6);
     }
 
     // --- Pointer bindings (FR-032, research S24) ---------------------------------------------

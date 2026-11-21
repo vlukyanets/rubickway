@@ -138,7 +138,9 @@ fn globals_and_versions_match_the_contract() {
         ("wp_viewporter", 1),
         ("xdg_wm_base", 6),
         ("zwlr_data_control_manager_v1", 2),
+        ("zwp_pointer_constraints_v1", 1),
         ("zwp_primary_selection_device_manager_v1", 1),
+        ("zwp_relative_pointer_manager_v1", 1),
     ];
     let expected: Vec<(String, u32)> = expected.iter().map(|(i, v)| (i.to_string(), *v)).collect();
     assert_eq!(globals, expected);

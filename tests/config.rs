@@ -243,6 +243,7 @@ fn builtin_and_console_switch_combinations_are_rejected() {
         "Mod+0",
         "Mod+Tab",
         "Mod+Shift+Tab",
+        "Mod+Escape",
         "Ctrl+Alt+F3",
     ] {
         let (config, warnings) = parse(&format!("binds {{ {taken} {{ spawn \"foot\"; }} }}"));
@@ -292,6 +293,20 @@ fn every_valid_binding_is_kept_in_order() {
     );
     // Only the rejected Mod+Q.
     assert_eq!(lines(&warnings), vec![Some(2)]);
+}
+
+#[test]
+fn a_spawn_on_mod_escape_is_refused_and_the_other_bindings_stay() {
+    // Mod+Escape releases a captured pointer (pointer-lock FR-008, research L7).
+    let (config, warnings) =
+        parse("binds {\n    Mod+Escape { spawn \"foot\"; }\n    Mod+T { spawn \"kitty\"; }\n}");
+    assert_eq!(config.spawns.len(), 1);
+    assert_eq!(config.spawns[0].command, vec!["kitty"]);
+    assert_eq!(lines(&warnings), vec![Some(2)]);
+    assert!(
+        warnings[0].message.contains("built-in shortcut"),
+        "{warnings:?}"
+    );
 }
 
 #[test]

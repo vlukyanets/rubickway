@@ -13,8 +13,10 @@ mod data_device;
 mod descriptors;
 mod dmabuf;
 mod output;
+mod pointer_constraints;
 mod popup;
 mod primary_selection;
+mod relative_pointer;
 mod release;
 mod seat;
 mod selection;
@@ -119,10 +121,25 @@ pub(crate) fn describe_process(client: &wayland_server::Client, dh: &DisplayHand
     format!(" (pid {}, {comm})", creds.pid)
 }
 
-/// Per-connection data: a number for the logs.
+/// Per-connection data: a number for the logs, and its process as described at connect.
 #[derive(Debug)]
 pub struct ClientState {
     pub id: u64,
+    /// ` (pid 1234, kitty)`, read once when the application connects (`describe_process`).
+    pub process: std::sync::OnceLock<String>,
+}
+
+/// `application 3 (pid 1234, kitty)` for log lines, without reading anything (the process was
+/// described when the application connected).
+pub(crate) fn describe_application(client: &wayland_server::Client) -> String {
+    match client.get_data::<ClientState>() {
+        Some(c) => format!(
+            "application {}{}",
+            c.id,
+            c.process.get().map_or("", String::as_str)
+        ),
+        None => "application ?".to_string(),
+    }
 }
 
 impl ClientData for ClientState {
@@ -197,6 +214,8 @@ pub struct ServerState {
     pub(crate) selection: selection::SelectionState,
     /// The primary selection's global, while it is offered (clipboard research C10).
     primary_selection_global: Option<wayland_server::backend::GlobalId>,
+    /// Locks and confinements (pointer-lock data-model "Server state").
+    pub(crate) constraints: pointer_constraints::ConstraintsState,
     /// Mapped windows and their root surface.
     pub(crate) windows: HashMap<WindowId, ObjectId>,
     /// The displays each window was last told it is on (`wl_surface.enter`).
@@ -270,6 +289,8 @@ impl Server {
         xdg_shell::create_global(&dh);
         seat::create_global(&dh);
         cursor_shape::create_global(&dh);
+        relative_pointer::create_global(&dh);
+        pointer_constraints::create_global(&dh);
         data_device::create_global(&dh);
         let primary_selection_global = primary_selection::create_global(&dh);
         data_control::ext::create_global(&dh);
@@ -306,6 +327,7 @@ impl Server {
                 seat: seat::SeatState::default(),
                 selection: selection::SelectionState::default(),
                 primary_selection_global: Some(primary_selection_global),
+                constraints: pointer_constraints::ConstraintsState::default(),
                 windows: HashMap::new(),
                 window_outputs: HashMap::new(),
                 window_events: Vec::new(),
@@ -336,14 +358,18 @@ impl Server {
     /// Serves an application connected through `stream`.
     pub fn insert_client(&mut self, stream: UnixStream) -> io::Result<ClientId> {
         let id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
-        let client = self
-            .state
-            .dh
-            .insert_client(stream, Arc::new(ClientState { id }))?;
-        tracing::info!(
-            "application {id} connected{}",
-            describe_process(&client, &self.state.dh)
-        );
+        let client = self.state.dh.insert_client(
+            stream,
+            Arc::new(ClientState {
+                id,
+                process: std::sync::OnceLock::new(),
+            }),
+        )?;
+        let process = describe_process(&client, &self.state.dh);
+        tracing::info!("application {id} connected{process}");
+        if let Some(c) = client.get_data::<ClientState>() {
+            let _ = c.process.set(process);
+        }
         Ok(client.id())
     }
 
