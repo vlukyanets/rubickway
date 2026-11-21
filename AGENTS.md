@@ -133,6 +133,10 @@ itself is the point (user-facing copy that needs it, tests for Unicode handling)
 - **Protocol tests** run the server in-process with `wayland-client` test clients
   (`tests/protocol/harness.rs`); every new global needs its version in the feature's
   `contracts/protocols.md`.
+- **Disconnect checks in protocol tests**: a paused test client (`paused = true`) that sends nothing
+  never notices that the server closed its socket - `is_disconnected()` only sees it when a flush
+  actually writes; have it send a request (e.g. `display.sync()`) before each check
+  (`tests/protocol/misbehaving.rs`, M10).
 - **Hardware code** (`src/backend/drm/`) cannot run in tests or CI (no seat, no card): keep its
   decisions in pure functions with unit tests, and check the rest through the feature's
   `quickstart.md` on real hardware, started from a text console.

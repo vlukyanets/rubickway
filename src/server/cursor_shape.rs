@@ -144,7 +144,7 @@ impl Dispatch<WpCursorShapeDeviceV1, Option<WlPointer>> for ServerState {
             return;
         }
         let name = shape_name(shape);
-        if seat::request_cursor(state, &client.id(), serial, AppCursor::Shape(name)) {
+        if seat::request_cursor(state, &client.id(), serial, AppCursor::Shape(name), None) {
             tracing::debug!(
                 "application {} asks for the {} pointer",
                 client_number(client),

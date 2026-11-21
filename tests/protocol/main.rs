@@ -8,6 +8,7 @@ mod harness;
 mod input;
 mod misbehaving;
 mod outputs;
+mod pointer_constraints;
 mod popups;
 mod surfaces;
 mod syncobj;

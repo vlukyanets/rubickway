@@ -8,10 +8,13 @@ use crate::input::{Button, InputEvent, ScrollSource};
 /// A libinput event reduced to the values RubickWay uses.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum RawEvent {
-    /// Accelerated relative motion.
+    /// Relative motion: accelerated, unaccelerated, and the event time in microseconds.
     Motion {
         dx: f64,
         dy: f64,
+        dx_unaccel: f64,
+        dy_unaccel: f64,
+        time_us: u64,
     },
     /// `seat_count`: how many devices on the seat hold this button after the event.
     Button {
@@ -64,8 +67,16 @@ pub(crate) enum Translated {
 /// seat (only the first press and the last release count).
 pub(crate) fn translate(event: RawEvent) -> Option<Translated> {
     let input = match event {
-        RawEvent::Motion { dx, dy } => InputEvent::PointerMoved {
+        RawEvent::Motion {
+            dx,
+            dy,
+            dx_unaccel,
+            dy_unaccel,
+            time_us,
+        } => InputEvent::PointerMoved {
             delta: Vector::new(dx, dy),
+            unaccel: Vector::new(dx_unaccel, dy_unaccel),
+            time_us,
         },
         RawEvent::Button {
             code,
@@ -127,7 +138,9 @@ use input::event::gesture::{
     GestureEndEvent, GestureEvent, GesturePinchEvent, GesturePinchEventTrait,
 };
 use input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
-use input::event::pointer::{Axis, ButtonState, PointerEvent, PointerScrollEvent};
+use input::event::pointer::{
+    Axis, ButtonState, PointerEvent, PointerEventTrait, PointerScrollEvent,
+};
 use input::event::{DeviceEvent, Event, EventTrait};
 
 use super::session::{InputDevices, SharedSession};
@@ -222,6 +235,9 @@ fn reduce(event: Event) -> Option<RawEvent> {
         Event::Pointer(PointerEvent::Motion(e)) => Some(RawEvent::Motion {
             dx: e.dx(),
             dy: e.dy(),
+            dx_unaccel: e.dx_unaccelerated(),
+            dy_unaccel: e.dy_unaccelerated(),
+            time_us: e.time_usec(),
         }),
         Event::Pointer(PointerEvent::Button(e)) => Some(RawEvent::Button {
             code: e.button(),
@@ -284,9 +300,17 @@ mod tests {
     #[test]
     fn motion_is_relative() {
         assert_eq!(
-            translate(RawEvent::Motion { dx: 3.5, dy: -2.0 }),
+            translate(RawEvent::Motion {
+                dx: 3.5,
+                dy: -2.0,
+                dx_unaccel: 1.25,
+                dy_unaccel: -0.5,
+                time_us: 1_234_567_890_123,
+            }),
             Some(Translated::Input(InputEvent::PointerMoved {
-                delta: Vector::new(3.5, -2.0)
+                delta: Vector::new(3.5, -2.0),
+                unaccel: Vector::new(1.25, -0.5),
+                time_us: 1_234_567_890_123,
             }))
         );
     }

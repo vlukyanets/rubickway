@@ -14,8 +14,14 @@ pub use xkbcommon::xkb::Keysym;
 pub enum InputEvent {
     /// The pointer moved by `delta` logical pixels (relative, accelerated motion from a
     /// device). The shell turns it into per-viewer enter, motion and leave events through the
-    /// layout (research S9).
-    PointerMoved { delta: Vector },
+    /// layout (research S9). `unaccel` is the device's unaccelerated movement and `time_us` the
+    /// event time in microseconds, for applications that ask for relative motion (pointer-lock
+    /// research L4).
+    PointerMoved {
+        delta: Vector,
+        unaccel: Vector,
+        time_us: u64,
+    },
     /// The pointer entered the viewer at `pos`.
     PointerEnter { pos: Point },
     /// The pointer moved to `pos` (may be outside the viewer during a drag).

@@ -9,6 +9,7 @@
 //! Mod+Shift + left moves and Mod + right resizes a window), Mod+Tab cycles focus, everything else
 //! goes to the window under the pointer or with keyboard focus, as [`ClientInput`]s. Maximize and fullscreen are decided here too (research W7, W8).
 
+mod constraint;
 mod cursor;
 mod geometry;
 mod popups;
@@ -16,13 +17,17 @@ mod positioner;
 mod route;
 mod windows;
 
+pub use constraint::{ConstraintInfo, ConstraintKind, ConstraintToken};
 pub use cursor::{AppCursor, CursorName};
 pub use geometry::*;
 pub use popups::{Popup, PopupId, Shown};
 pub use positioner::{Adjust, Anchor8, IRect, PopupRules, place};
-pub use route::ClientInput;
+pub use route::{ClientInput, ConstraintChange, ConstraintEnd};
 pub use windows::*;
 
+use std::collections::{HashMap, HashSet};
+
+use constraint::{Constraint, ConstraintState};
 use route::{Grab, Op, Operation, PopupGrab, Router};
 
 use crate::canvas::{Camera, Layout, LayoutEntry, Point, Rect, Size, Vector, ViewerId};
@@ -123,6 +128,14 @@ pub enum WindowEvent {
     },
     /// The application hid or destroyed a popup (or its surface); its children went first.
     PopupUnmapped { id: PopupId },
+    /// The window's lock or confinement after a creation or a commit that changed what is
+    /// reported, or its end (`None`: destroyed by the application, defunct, or its surface gone).
+    /// Sent only for windows, and again after `Mapped` for one created earlier (pointer-lock
+    /// research L12).
+    ConstraintChanged {
+        id: WindowId,
+        constraint: Option<ConstraintInfo>,
+    },
 }
 
 /// States the shell asks a window to have (`activated` follows keyboard focus).
@@ -227,6 +240,15 @@ pub struct Shell {
     popup_input: Vec<ClientInput>,
     /// A popup grab ended during this call: the pointer is re-targeted at its end (FR-013).
     grab_ended: bool,
+    /// Each window's lock or confinement as last reported (pointer-lock data-model).
+    constraints: HashMap<WindowId, Constraint>,
+    /// The window whose constraint is `Active`: at most one, as only the focused window's can be.
+    applying: Option<WindowId>,
+    /// A resize ended in this call: a constraint stopping now stops for `ConstraintEnd::Resize`.
+    resize_ended: bool,
+    /// Windows whose constraint the user released with Mod+Escape: none of their constraints
+    /// applies until they receive a button press (FR-008, M11).
+    released: HashSet<WindowId>,
     dirty: bool,
 }
 
@@ -298,6 +320,10 @@ impl Shell {
             app_cursor: None,
             popup_input: Vec::new(),
             grab_ended: false,
+            constraints: HashMap::new(),
+            applying: None,
+            resize_ended: false,
+            released: HashSet::new(),
             dirty: true,
         }
     }
@@ -398,6 +424,10 @@ impl Shell {
             None => match self.app_cursor {
                 Some((w, cursor)) if self.router.entered == Some(w) => match cursor {
                     AppCursor::Shape(name) => CursorShape::Named(name),
+                    // After Mod+Escape the pointer stays visible over the window until the
+                    // click that may capture it again: an application that ignores `unlocked`
+                    // (Firefox) would keep it hidden (FR-008, research L16).
+                    AppCursor::Hidden if self.released.contains(&w) => CursorShape::Default,
                     AppCursor::Hidden => CursorShape::Hidden,
                 },
                 _ => CursorShape::Default,
@@ -559,6 +589,8 @@ impl Shell {
         self.sync_active();
         self.dirty = true;
         out.append(&mut self.popup_input);
+        // The pointer may have left a constraint's area (spec Edge Cases).
+        self.update_constraint(&mut out);
         out
     }
 
@@ -647,6 +679,10 @@ impl Shell {
                 let before = self.windows.get(id).map(|w| w.rect());
                 self.windows.update(id, size, input);
                 self.windows.set_limits(id, limits);
+                if let Some(c) = self.constraints.get_mut(&id) {
+                    // Its input shape may have changed.
+                    c.changed();
+                }
                 if let Some(win) = self.windows.get(id)
                     && before.is_some_and(|r| r != win.rect())
                 {
@@ -719,12 +755,22 @@ impl Shell {
                 input,
             } => self.popup_shown(id, Shown { at, size, input }, &mut out),
             WindowEvent::PopupUnmapped { id } => self.popup_gone(id, &mut out),
+            WindowEvent::ConstraintChanged { id, constraint } => {
+                self.constraint_changed(id, constraint, &mut out);
+            }
             WindowEvent::CursorChanged { id, cursor } => {
                 if self.router.entered == Some(id) && self.router.operation.is_none() {
                     self.app_cursor = Some((id, cursor));
                 }
             }
             WindowEvent::Unmapped { id } => {
+                // Its constraint stops; the server reports it again if the window is shown
+                // again (research L12).
+                if self.applying == Some(id) {
+                    self.stop_constraint(id, ConstraintEnd::WindowGone, &mut out);
+                }
+                self.constraints.remove(&id);
+                self.released.remove(&id);
                 self.windows.unmap(id);
                 if self.app_cursor.is_some_and(|(w, _)| w == id) {
                     self.app_cursor = None;
@@ -777,6 +823,7 @@ impl Shell {
         self.focus_changed(before, &mut out);
         out.append(&mut self.popup_input);
         self.after_grab(&mut out);
+        self.update_constraint(&mut out);
         out
     }
 
@@ -1639,6 +1686,8 @@ impl Shell {
             ..
         } = operation.op
         {
+            // A constraint stopping now stops because of the resize (FR-009, FR-015).
+            self.resize_ended = true;
             match last {
                 Some(size) => {
                     self.commands.push(WindowCommand::Configure {
@@ -1766,8 +1815,12 @@ impl Shell {
                 pressed,
                 time_ms,
             } => self.key(keycode, binding_sym, pressed, time_ms, &mut out),
-            InputEvent::PointerMoved { delta } => {
-                self.relative_motion(delta, &mut out);
+            InputEvent::PointerMoved {
+                delta,
+                unaccel,
+                time_us,
+            } => {
+                self.device_motion(delta, unaccel, time_us, &mut out);
                 Effect::default()
             }
             InputEvent::Modifiers { mods, raw } => {
@@ -1830,6 +1883,7 @@ impl Shell {
         }
         out.append(&mut self.popup_input);
         self.after_grab(&mut out);
+        self.update_constraint(&mut out);
         (effect, out)
     }
 
@@ -1872,6 +1926,323 @@ impl Shell {
             return;
         };
         self.pointer_moved(&InputEvent::PointerMotion { pos }, pos, out);
+    }
+
+    /// A device motion (pointer-lock research L4, L9): the window that has the pointer is told
+    /// the movement first, unless a gesture runs; a lock keeps the pointer where it is, anything
+    /// else moves it through the layout.
+    fn device_motion(
+        &mut self,
+        delta: Vector,
+        unaccel: Vector,
+        time_us: u64,
+        out: &mut Vec<ClientInput>,
+    ) {
+        let suspended = self.suspended();
+        let target = self
+            .router
+            .grab
+            .as_ref()
+            .map(|g| g.window)
+            .or(self.router.entered);
+        if !suspended && let Some(window) = target {
+            // In the window's coordinates, like the pointer position (FR-003).
+            let zoom = self.av().camera().zoom;
+            out.push(ClientInput::RelativeMotion {
+                window,
+                delta: delta / zoom,
+                unaccel,
+                time_us,
+            });
+        }
+        if !suspended && self.locked() {
+            // The pointer stays; only the movement is told (FR-004).
+            if let Some(window) = target {
+                out.push(ClientInput::PointerFrame { window });
+            }
+            return;
+        }
+        let delta = match self.confined(delta) {
+            Some(kept) if !suspended => kept,
+            _ => delta,
+        };
+        self.relative_motion(delta, out);
+    }
+
+    /// The part of a motion by `delta` (logical pixels) an applying confinement allows: the
+    /// pointer stays inside its effective area, sliding along its edge (FR-005, research L8).
+    /// `None` without an applying confinement.
+    fn confined(&mut self, delta: Vector) -> Option<Vector> {
+        let window = self.applying?;
+        if self.constraints.get(&window)?.info.kind != ConstraintKind::Confine {
+            return None;
+        }
+        let p = self.pointer_canvas()?;
+        let zoom = self.av().camera().zoom;
+        let win = self.windows.get(window)?;
+        let view = self.view_in(win);
+        let from = Point::new(p.x - win.origin.x, p.y - win.origin.y);
+        let to = from + delta / zoom;
+        let area = self
+            .constraints
+            .get_mut(&window)?
+            .area(win.size, &win.input, view);
+        let at = constraint::confine(area, from, to);
+        Some((at - from) * zoom)
+    }
+
+    /// A confinement's area changed while it applies: a pointer left outside moves to the
+    /// nearest point inside, with no relative motion (FR-014).
+    fn pull_inside(&mut self, window: WindowId, out: &mut Vec<ClientInput>) {
+        let Some(p) = self.pointer_canvas() else {
+            return;
+        };
+        let Some(win) = self.windows.get(window) else {
+            return;
+        };
+        let view = self.view_in(win);
+        let here = Point::new(p.x - win.origin.x, p.y - win.origin.y);
+        let Some(c) = self.constraints.get_mut(&window) else {
+            return;
+        };
+        let area = c.area(win.size, &win.input, view);
+        if area.is_empty() || constraint::inside(area, here) {
+            return;
+        }
+        let at = constraint::confine(area, here, here);
+        self.move_pointer_to(window, at, out);
+    }
+
+    /// Whether a pan, move or resize runs: an applying constraint is suspended silently
+    /// (FR-009, research L6).
+    fn suspended(&self) -> bool {
+        self.router.operation.is_some()
+            || self.router.pan_button.is_some()
+            || self.pan_viewer.is_some()
+            || self.av().is_panning()
+    }
+
+    /// Whether an applying lock holds the pointer.
+    fn locked(&self) -> bool {
+        self.applying
+            .and_then(|w| self.constraints.get(&w))
+            .is_some_and(|c| c.info.kind == ConstraintKind::Lock)
+    }
+
+    /// The part of `window` shown on the active viewer, in the window's coordinates.
+    fn view_in(&self, window: &Window) -> Rect {
+        self.view_rect()
+            .translate(Point::new(0.0, 0.0) - window.origin)
+    }
+
+    /// Why `window`'s constraint cannot apply now, or `None` if it can (research L5).
+    fn constraint_blocked(&mut self, window: WindowId) -> Option<ConstraintEnd> {
+        if !self.router.viewer_focused || self.windows.focus() != Some(window) {
+            return Some(ConstraintEnd::Focus);
+        }
+        if self
+            .router
+            .popup_grab
+            .as_ref()
+            .is_some_and(|g| g.window == window && g.keyboard.is_some())
+        {
+            // The user must be able to use the menu (spec Edge Cases).
+            return Some(ConstraintEnd::Focus);
+        }
+        let Some(p) = self.pointer_canvas() else {
+            return Some(ConstraintEnd::PointerLeft);
+        };
+        // Over the window or one of its popups.
+        if self.hit(p).map(|(id, _)| id) != Some(window) {
+            return Some(ConstraintEnd::PointerLeft);
+        }
+        let Some(win) = self.windows.get(window) else {
+            return Some(ConstraintEnd::WindowGone);
+        };
+        let view = self.view_in(win);
+        let local = Point::new(p.x - win.origin.x, p.y - win.origin.y);
+        let c = self.constraints.get_mut(&window)?;
+        if constraint::inside(c.area(win.size, &win.input, view), local) {
+            None
+        } else {
+            Some(ConstraintEnd::PointerLeft)
+        }
+    }
+
+    /// Starts and stops constraints after an event (research L5): the applying one stops when
+    /// its conditions fail, and the focused window's starts when they hold. Nothing changes
+    /// while a pan, move or resize runs (research L6). Called at the end of `handle`, `apply`
+    /// and `remove_viewer`.
+    fn update_constraint(&mut self, out: &mut Vec<ClientInput>) {
+        if self.suspended() {
+            return;
+        }
+        let resized = std::mem::take(&mut self.resize_ended);
+        if let Some(window) = self.applying
+            && let Some(why) = self.constraint_blocked(window)
+        {
+            let why = match why {
+                ConstraintEnd::PointerLeft if resized => ConstraintEnd::Resize,
+                other => other,
+            };
+            self.stop_constraint(window, why, out);
+        }
+        if self.applying.is_some() {
+            return;
+        }
+        let Some(focus) = self.windows.focus() else {
+            return;
+        };
+        if self
+            .constraints
+            .get(&focus)
+            .is_some_and(|c| c.state == ConstraintState::Waiting)
+            && !self.released.contains(&focus)
+            && self.constraint_blocked(focus).is_none()
+            && let Some(c) = self.constraints.get_mut(&focus)
+        {
+            c.state = ConstraintState::Active;
+            self.applying = Some(focus);
+            out.push(ClientInput::Constraint {
+                token: c.info.token,
+                change: ConstraintChange::Start,
+            });
+        }
+    }
+
+    /// Stops `window`'s applying constraint for `why`: a single-use one ends, a lasting one waits.
+    /// After the release shortcut the window's constraints - this one or one asked for later -
+    /// wait for a click it receives (FR-008, M11). A lock then puts the pointer at its release
+    /// point (FR-007) - unless it stopped because the pointer left or the window went away.
+    fn stop_constraint(
+        &mut self,
+        window: WindowId,
+        why: ConstraintEnd,
+        out: &mut Vec<ClientInput>,
+    ) {
+        if self.applying == Some(window) {
+            self.applying = None;
+        }
+        let Some(c) = self.constraints.get_mut(&window) else {
+            return;
+        };
+        out.push(ClientInput::Constraint {
+            token: c.info.token,
+            change: ConstraintChange::Stop(why),
+        });
+        let (kind, hint) = (c.info.kind, c.info.hint);
+        if c.info.persistent {
+            c.state = ConstraintState::Waiting;
+        } else {
+            self.constraints.remove(&window);
+        }
+        if why == ConstraintEnd::Shortcut {
+            self.released.insert(window);
+        }
+        let moves = matches!(why, ConstraintEnd::Focus | ConstraintEnd::Shortcut);
+        if kind == ConstraintKind::Lock
+            && moves
+            && let Some(hint) = hint
+        {
+            self.warp(window, hint, out);
+        }
+    }
+
+    /// Moves the pointer to window point `hint` if that is inside the window's part on the
+    /// active viewer (FR-007): no relative motion, a `PointerMotion` for the window.
+    fn warp(&mut self, window: WindowId, hint: Point, out: &mut Vec<ClientInput>) {
+        let Some(win) = self.windows.get(window) else {
+            return;
+        };
+        let view = self.view_in(win);
+        let shown = constraint::effective_area(None, win.size, &win.input, view);
+        if constraint::inside(&shown, hint) {
+            self.move_pointer_to(window, hint, out);
+        }
+    }
+
+    /// Moves the pointer to window point `at` on the active viewer; the window gets a
+    /// `PointerMotion` and no relative motion (the protocol's rule for such moves).
+    fn move_pointer_to(&mut self, window: WindowId, at: Point, out: &mut Vec<ClientInput>) {
+        let Some(win) = self.windows.get(window) else {
+            return;
+        };
+        let canvas = Point::new(win.origin.x + at.x, win.origin.y + at.y);
+        let Some(active) = self.active else {
+            return;
+        };
+        let logical = self.av().camera().to_logical(canvas, self.av().size());
+        let Some(origin) = self.layout.origin(active) else {
+            return;
+        };
+        self.layout
+            .move_to(Point::new(origin.x + logical.x, origin.y + logical.y));
+        self.av_mut()
+            .handle(&InputEvent::PointerMotion { pos: logical });
+        if self.router.entered == Some(window) {
+            out.push(ClientInput::PointerMotion { window, pos: at });
+            out.push(ClientInput::PointerFrame { window });
+        } else {
+            self.retarget(canvas, true, out);
+        }
+    }
+
+    /// The server reported `window`'s constraint (research L12): a new one waits, a changed one
+    /// keeps its state, a removed one stops without a decision (its object is gone).
+    fn constraint_changed(
+        &mut self,
+        window: WindowId,
+        constraint: Option<ConstraintInfo>,
+        out: &mut Vec<ClientInput>,
+    ) {
+        let same = match (&constraint, self.constraints.get(&window)) {
+            (Some(info), Some(c)) => c.info.token == info.token,
+            _ => false,
+        };
+        if !same {
+            self.constraint_removed(window, out);
+        }
+        let Some(info) = constraint else {
+            return;
+        };
+        if self.windows.get(window).is_none() {
+            return;
+        }
+        match self.constraints.get_mut(&window) {
+            Some(c) => {
+                c.info = info;
+                c.changed();
+                if self.applying == Some(window) && c.info.kind == ConstraintKind::Confine {
+                    self.pull_inside(window, out);
+                }
+            }
+            None => {
+                self.constraints.insert(window, Constraint::new(info));
+            }
+        }
+    }
+
+    /// The application removed `window`'s constraint (or replaced it): if it applied, a lock
+    /// puts the pointer at its release point (FR-007, research L9).
+    fn constraint_removed(&mut self, window: WindowId, out: &mut Vec<ClientInput>) {
+        let Some(c) = self.constraints.remove(&window) else {
+            return;
+        };
+        if self.applying != Some(window) {
+            return;
+        }
+        self.applying = None;
+        if c.info.kind == ConstraintKind::Lock
+            && let Some(hint) = c.info.hint
+        {
+            self.warp(window, hint, out);
+        }
+    }
+
+    /// A button press reached `window`: after the release shortcut, its constraints may apply
+    /// again (FR-008).
+    fn press_delivered(&mut self, window: WindowId) {
+        self.released.remove(&window);
     }
 
     /// The focused window, if the viewer has the keyboard.
@@ -2015,6 +2386,7 @@ impl Shell {
                     pressed,
                 });
                 out.push(ClientInput::PointerFrame { window });
+                self.press_delivered(window);
                 return Effect::default();
             }
             let pointer = self.pointer_canvas();
@@ -2093,6 +2465,7 @@ impl Shell {
                 pressed,
             });
             out.push(ClientInput::PointerFrame { window });
+            self.press_delivered(window);
             return Effect::default();
         }
 
@@ -2259,6 +2632,14 @@ impl Shell {
                         spawn: Some(n),
                         ..Effect::default()
                     },
+                    // Takes the pointer back from an application (pointer-lock FR-008); a
+                    // lasting constraint then waits for a click its window receives.
+                    Action::ReleasePointer => {
+                        if let Some(window) = self.applying {
+                            self.stop_constraint(window, ConstraintEnd::Shortcut, out);
+                        }
+                        Effect::default()
+                    }
                 };
             }
             if let Some(window) = self.focused_window() {

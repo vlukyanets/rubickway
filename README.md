@@ -111,6 +111,15 @@ cliphist, and wl-clip-persist to keep copied content after its application close
 RubickWay itself keeps no copy. Any program may use these tools' protocols, so any program can
 read the clipboard. Dragging between windows (drag-and-drop) is not there yet.
 
+Games, 3D tools such as Blender and remote desktop clients can capture the pointer: lock it for
+mouse-look, so the view keeps turning however far the mouse moves, or keep it inside their window.
+They capture it only while their window has the keyboard focus and the pointer is over it, and
+the canvas stays in your hands meanwhile: Mod + drag pans, Mod + scroll zooms, Mod+Shift + drag
+moves the window, and every shortcut works. **Mod+Escape always takes the pointer back.** An
+application that captures it again on its own gets it back only after you click into its window,
+so it can never keep the pointer against your will. Mod+Escape is built in: a spawn binding on it
+is refused with a warning, like the other built-in shortcuts.
+
 ## Configuration
 
 `~/.config/rubickway/config.kdl` (or `$XDG_CONFIG_HOME/rubickway/config.kdl`), in
@@ -210,6 +219,7 @@ focus.
 | Mod+Tab / Mod+Shift+Tab | focus the next / previous window and bring it into view |
 | Mod+Q | ask the focused window to close |
 | Mod+0 | back to this monitor's home view at 100% |
+| Mod+Escape | take the pointer back from an application that locked or confined it; it captures it again only after a click into its window |
 | Mod+Return | start kitty (the default spawn binding) |
 | Mod+Shift+Q, twice within 2 s | quit RubickWay |
 | Ctrl+Alt+F1 .. F12 | switch to that text console; switching back resumes RubickWay |

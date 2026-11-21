@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd};
 
+use wayland_protocols::wp::relative_pointer::zv1::server::zwp_relative_pointer_v1::ZwpRelativePointerV1;
 use wayland_server::backend::{ClientId, ObjectId};
 use wayland_server::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_server::protocol::wl_pointer::{self, WlPointer};
@@ -17,7 +18,7 @@ use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, 
 
 use super::compositor::{self, Role};
 use super::dmabuf::client_number;
-use super::{ServerState, popup, selection, xdg_shell};
+use super::{ServerState, pointer_constraints, popup, relative_pointer, selection, xdg_shell};
 use crate::canvas::Point;
 use crate::ffi::shm_map::sealed_memfd;
 use crate::input::{RawModifiers, ScrollSource};
@@ -55,12 +56,17 @@ pub(crate) struct SeatState {
     enter_serial: Option<u32>,
     /// What the focused client asked for since that enter.
     focus_cursor: AppCursor,
+    /// The surface of that request, if it was `set_cursor` with one: its commits change what
+    /// is shown, an image or nothing (pointer-lock research L15).
+    cursor_surface: Option<ObjectId>,
     /// Per application, the serial of its latest button press and of its latest key press or
     /// release: a popup grab must carry one of them (popups research P9).
     popup_serials: HashMap<ClientId, (Option<u32>, Option<u32>)>,
     /// Per application, the serials of its latest key, button and keyboard-enter events: setting
     /// the clipboard must carry one of them (clipboard research C4).
     input_serials: HashMap<ClientId, SerialRing>,
+    /// Per application, its relative pointers in creation order (pointer-lock research L11).
+    pub relative_pointers: HashMap<ClientId, Vec<ZwpRelativePointerV1>>,
 }
 
 /// The latest few serials of one application's input events (clipboard research C4).
@@ -106,8 +112,10 @@ impl Default for SeatState {
             pointer_window: None,
             enter_serial: None,
             focus_cursor: ENTER_CURSOR,
+            cursor_surface: None,
             popup_serials: HashMap::new(),
             input_serials: HashMap::new(),
+            relative_pointers: HashMap::new(),
         }
     }
 }
@@ -128,6 +136,19 @@ pub(crate) fn keyboard_client(state: &ServerState) -> Option<ClientId> {
     state
         .seat
         .keyboard_surface
+        .as_ref()
+        .and_then(|s| s.client())
+        .map(|c| c.id())
+}
+
+/// The application whose surface of `window` has the pointer, if the pointer is on `window`.
+pub(crate) fn pointer_client(state: &ServerState, window: WindowId) -> Option<ClientId> {
+    if state.seat.pointer_window != Some(window) {
+        return None;
+    }
+    state
+        .seat
+        .pointer_surface
         .as_ref()
         .and_then(|s| s.client())
         .map(|c| c.id())
@@ -196,12 +217,14 @@ fn note_user_serial(state: &mut ServerState, surface: &WlSurface, serial: u32, b
 /// A cursor request (`wl_pointer.set_cursor` or `wp_cursor_shape_device_v1.set_shape`) from
 /// `client`: it counts only while the pointer is over that client's surface and with the serial
 /// of the latest enter (cursor-shapes research C2); the shell hears of it only on a change.
+/// `surface` is the cursor surface of a `set_cursor`, whose later commits count too.
 /// Returns whether it changed what is shown, for the caller's debug line.
 pub(crate) fn request_cursor(
     state: &mut ServerState,
     client: &ClientId,
     serial: u32,
     cursor: AppCursor,
+    surface: Option<ObjectId>,
 ) -> bool {
     let focused = state
         .seat
@@ -212,6 +235,12 @@ pub(crate) fn request_cursor(
     if !focused || state.seat.enter_serial != Some(serial) {
         return false;
     }
+    state.seat.cursor_surface = surface;
+    show_cursor(state, cursor)
+}
+
+/// Makes `cursor` the focused client's; whether that changed anything.
+fn show_cursor(state: &mut ServerState, cursor: AppCursor) -> bool {
     let Some(window) = state.seat.pointer_window else {
         return false;
     };
@@ -223,6 +252,32 @@ pub(crate) fn request_cursor(
         .window_events
         .push(WindowEvent::CursorChanged { id: window, cursor });
     true
+}
+
+/// What a cursor surface shows: the arrow for an image (cursor images are not drawn), nothing
+/// without one - GTK 3 hides the pointer that way (pointer-lock research L15).
+fn surface_cursor(state: &ServerState, id: &ObjectId) -> (AppCursor, &'static str) {
+    match state.surfaces.get(id).and_then(|s| s.buffer_size) {
+        Some(_) => (
+            ENTER_CURSOR,
+            "shows its own pointer image (the arrow is drawn)",
+        ),
+        None => (AppCursor::Hidden, "hides the pointer"),
+    }
+}
+
+/// A commit of surface `id` took effect: if it is the cursor surface of the focused client, what
+/// it now shows counts.
+pub(crate) fn surface_committed(state: &mut ServerState, id: &ObjectId) {
+    if state.seat.cursor_surface.as_ref() != Some(id) {
+        return;
+    }
+    let (cursor, what) = surface_cursor(state, id);
+    if show_cursor(state, cursor)
+        && let Ok(client) = state.dh.get_client(id.clone())
+    {
+        tracing::debug!("application {} {what}", client_number(&client));
+    }
 }
 
 fn same_client(resource: &impl Resource, surface: &WlSurface) -> bool {
@@ -289,6 +344,7 @@ fn pointer_enter(state: &mut ServerState, window: WindowId, surface: WlSurface, 
     state.seat.pointer_surface = Some(surface);
     state.seat.pointer_window = Some(window);
     state.seat.enter_serial = Some(serial);
+    state.seat.cursor_surface = None;
     // The arrow until the client asks for something; the shell forgets its own copy when the
     // pointer leaves a window, so it needs telling only within one window (a subsurface).
     if state.seat.focus_cursor != ENTER_CURSOR {
@@ -469,6 +525,15 @@ pub(crate) fn deliver(state: &mut ServerState, inputs: &[ClientInput], time_ms: 
                 if let Some(surface) = state.seat.keyboard_surface.clone() {
                     send_modifiers(state, &surface);
                 }
+            }
+            ClientInput::RelativeMotion {
+                window,
+                delta,
+                unaccel,
+                time_us,
+            } => relative_pointer::send_motion(state, *window, *delta, *unaccel, *time_us),
+            ClientInput::Constraint { token, change } => {
+                pointer_constraints::decide(state, *token, *change);
             }
         }
     }
@@ -694,28 +759,27 @@ impl Dispatch<WlPointer, ()> for ServerState {
         _: &mut DataInit<'_, Self>,
     ) {
         // Cursor images are accepted but not shown (the arrow is drawn); a cursor without a
-        // surface hides the pointer over the client's windows (FR-008, cursor-shapes
-        // contracts/protocols.md "wl_pointer").
+        // surface, or a cursor surface without an image, hides the pointer over the client's
+        // windows (FR-008, cursor-shapes contracts/protocols.md "wl_pointer", pointer-lock
+        // research L15).
         let wl_pointer::Request::SetCursor {
             serial, surface, ..
         } = request
         else {
             return;
         };
-        let (cursor, what) = match surface {
+        let ((cursor, what), surface) = match surface {
             Some(surface) => {
-                if !compositor::set_role(state, &surface.id(), Role::Cursor) {
+                let id = surface.id();
+                if !compositor::set_role(state, &id, Role::Cursor) {
                     pointer.post_error(wl_pointer::Error::Role, "the surface already has a role");
                     return;
                 }
-                (
-                    ENTER_CURSOR,
-                    "shows its own pointer image (the arrow is drawn)",
-                )
+                (surface_cursor(state, &id), Some(id))
             }
-            None => (AppCursor::Hidden, "hides the pointer"),
+            None => ((AppCursor::Hidden, "hides the pointer"), None),
         };
-        if request_cursor(state, &client.id(), serial, cursor) {
+        if request_cursor(state, &client.id(), serial, cursor, surface) {
             tracing::debug!("application {} {what}", client_number(client));
         }
     }

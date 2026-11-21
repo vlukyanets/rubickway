@@ -4,7 +4,7 @@
 use crate::canvas::{Point, Rect, Size, Vector};
 use crate::input::{Modifiers, RawModifiers, ScrollSource};
 
-use super::{AppId, Edges, PopupId, WindowId};
+use super::{AppId, ConstraintToken, Edges, PopupId, WindowId};
 
 /// Input for an application's window, in window coordinates (backend-neutral).
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +57,44 @@ pub enum ClientInput {
         window: WindowId,
         popup: Option<PopupId>,
     },
+    /// A device movement while `window` has the pointer (pointer-lock research L4): `delta`
+    /// accelerated, in the window's coordinates (the device delta divided by the zoom);
+    /// `unaccel` the device's unaccelerated delta, unscaled; `time_us` the event time.
+    RelativeMotion {
+        window: WindowId,
+        delta: Vector,
+        unaccel: Vector,
+        time_us: u64,
+    },
+    /// The shell starts or stops applying a lock or confinement (pointer-lock research L5).
+    Constraint {
+        token: ConstraintToken,
+        change: ConstraintChange,
+    },
+}
+
+/// What the shell decided about a constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintChange {
+    /// It applies from now on (`locked` / `confined`).
+    Start,
+    /// It no longer applies (`unlocked` / `unconfined`); a single-use one ends for good.
+    Stop(ConstraintEnd),
+}
+
+/// Why a constraint stopped applying, for the debug log (pointer-lock FR-015).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintEnd {
+    /// The window lost the keyboard focus, or a grabbing popup of it took the keyboard.
+    Focus,
+    /// The pointer is no longer over the constraint's area.
+    PointerLeft,
+    /// The user pressed the release shortcut (Mod+Escape).
+    Shortcut,
+    /// The window was hidden or closed.
+    WindowGone,
+    /// A resize left the pointer outside the area.
+    Resize,
 }
 
 /// A button pressed on a window: it gets all pointer input until the last button is released.
